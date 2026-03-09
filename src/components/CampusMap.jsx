@@ -7,7 +7,7 @@ import {
   Navigation, Navigation2, Compass, Activity, Edit3, Settings2,
   MapPin, Route, Trash2, Save, MousePointer2, PlusCircle,
   ChevronLeft, X, Clock, Milestone, ArrowUpCircle, ZoomIn, ZoomOut,
-  CheckCircle, AlertTriangle, Info, MapPinned, LocateFixed
+  CheckCircle, AlertTriangle, Info, MapPinned, LocateFixed, UploadCloud
 } from 'lucide-react';
 
 // ─── Token ────────────────────────────────────────────────────────────────────
@@ -36,6 +36,123 @@ function centroidOfPolygon(coords) {
 function lngLatDist(a, b) {
   const dx = a[0] - b[0], dy = a[1] - b[1];
   return Math.sqrt(dx * dx + dy * dy) * 111000; // approx metres
+}
+
+function findShortestDrawnPath(startPt, targetPt, routes) {
+  if (!routes || routes.length === 0) return [startPt, targetPt];
+
+  const nodes = [startPt, targetPt];
+  const adj = [[], []];
+
+  const addNode = (pt) => { nodes.push(pt); adj.push([]); return nodes.length - 1; };
+  const routeVerticesStart = nodes.length;
+
+  routes.forEach(r => {
+    let offset = nodes.length;
+    r.coords.forEach(pt => addNode(pt));
+    for (let i = 0; i < r.coords.length - 1; i++) {
+      const u = offset + i, v = offset + i + 1;
+      const d = lngLatDist(nodes[u], nodes[v]);
+      adj[u].push({ node: v, weight: d });
+      adj[v].push({ node: u, weight: d });
+    }
+  });
+
+  // Implicitly connect nearby intersections 
+  for (let i = routeVerticesStart; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const d = lngLatDist(nodes[i], nodes[j]);
+      if (d < 12) { // Allow snapping if route lines were drawn slightly apart (up to 12m)
+        adj[i].push({ node: j, weight: d });
+        adj[j].push({ node: i, weight: d });
+      }
+    }
+  }
+
+  // Find closest point on ALL segments
+  const snapToRoutes = (pIdx) => {
+    let minD = Infinity;
+    let bestP = null;
+    let bestEdge = null;
+    let currentIdx = routeVerticesStart;
+
+    routes.forEach(r => {
+      for (let i = 0; i < r.coords.length - 1; i++) {
+        const u = currentIdx + i, v = currentIdx + i + 1;
+        const a = nodes[u], b = nodes[v], p = nodes[pIdx];
+
+        const dx = b[0] - a[0], dy = b[1] - a[1];
+        let proj;
+        if (dx === 0 && dy === 0) {
+          proj = a;
+        } else {
+          const t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy);
+          if (t < 0) proj = a;
+          else if (t > 1) proj = b;
+          else proj = [a[0] + t * dx, a[1] + t * dy];
+        }
+
+        const d = lngLatDist(p, proj);
+        if (d < minD) { minD = d; bestP = proj; bestEdge = { u, v }; }
+      }
+      currentIdx += r.coords.length;
+    });
+
+    if (bestEdge) {
+      const ptIdx = addNode(bestP);
+      adj[pIdx].push({ node: ptIdx, weight: minD });
+      adj[ptIdx].push({ node: pIdx, weight: minD });
+
+      const d1 = lngLatDist(bestP, nodes[bestEdge.u]);
+      adj[ptIdx].push({ node: bestEdge.u, weight: d1 });
+      adj[bestEdge.u].push({ node: ptIdx, weight: d1 });
+
+      const d2 = lngLatDist(bestP, nodes[bestEdge.v]);
+      adj[ptIdx].push({ node: bestEdge.v, weight: d2 });
+      adj[bestEdge.v].push({ node: ptIdx, weight: d2 });
+    }
+  };
+
+  snapToRoutes(0);
+  snapToRoutes(1);
+
+  // Dijkstra's algorithm
+  const dist = Array(nodes.length).fill(Infinity);
+  const prev = Array(nodes.length).fill(-1);
+  dist[0] = 0;
+
+  const unvisited = new Set(nodes.map((_, i) => i));
+
+  while (unvisited.size > 0) {
+    let u = -1, minDist = Infinity;
+    for (const v of unvisited) {
+      if (dist[v] < minDist) { minDist = dist[v]; u = v; }
+    }
+    if (u === -1 || u === 1 || minDist === Infinity) break;
+    unvisited.delete(u);
+
+    for (const neighbor of adj[u]) {
+      if (!unvisited.has(neighbor.node)) continue;
+      const alt = dist[u] + neighbor.weight;
+      if (alt < dist[neighbor.node]) {
+        dist[neighbor.node] = alt;
+        prev[neighbor.node] = u;
+      }
+    }
+  }
+
+  const path = [];
+  let curr = 1;
+  if (prev[curr] !== -1 || curr === 0) {
+    while (curr !== -1) {
+      path.unshift(nodes[curr]);
+      curr = prev[curr];
+    }
+  } else {
+    return [startPt, targetPt];
+  }
+
+  return path;
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
@@ -124,11 +241,12 @@ function ParkingModal({ onConfirm, onCancel, gates }) {
   const [name, setName] = useState('');
   const [slots, setSlots] = useState('50');
   const [entryGate, setEntryGate] = useState('');
+  const [exitGate, setExitGate] = useState('');
   const ref = useRef();
   useEffect(() => { ref.current?.focus(); }, []);
   return (
     <ModalShell title="🅿️ Name This Parking Area" onClose={onCancel}>
-      <form onSubmit={e => { e.preventDefault(); if (name.trim()) onConfirm({ name: name.trim(), totalSlots: parseInt(slots) || 50, entryGate }); }}>
+      <form onSubmit={e => { e.preventDefault(); if (name.trim()) onConfirm({ name: name.trim(), totalSlots: parseInt(slots) || 50, entryGate, exitGate }); }}>
         <div style={{ marginBottom: 14 }}>
           <label style={lStyle}>Parking Area Name</label>
           <input ref={ref} style={iStyle} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Block-A Parking" />
@@ -137,12 +255,21 @@ function ParkingModal({ onConfirm, onCancel, gates }) {
           <label style={lStyle}>Total Slots</label>
           <input style={iStyle} type="number" min={1} value={slots} onChange={e => setSlots(e.target.value)} placeholder="50" />
         </div>
-        <div style={{ marginBottom: 22 }}>
-          <label style={lStyle}>Entry Gate (Optional)</label>
-          <select style={{ ...iStyle, appearance: 'menulist' }} value={entryGate} onChange={e => setEntryGate(e.target.value)}>
-            <option value="">Select a Gate...</option>
-            {gates.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
-          </select>
+        <div style={{ display: 'flex', gap: 10, marginBottom: 22 }}>
+          <div style={{ flex: 1 }}>
+            <label style={lStyle}>Entry Gate</label>
+            <select style={{ ...iStyle, appearance: 'menulist' }} value={entryGate} onChange={e => setEntryGate(e.target.value)}>
+              <option value="">Select...</option>
+              {gates.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </select>
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={lStyle}>Exit Gate</label>
+            <select style={{ ...iStyle, appearance: 'menulist' }} value={exitGate} onChange={e => setExitGate(e.target.value)}>
+              <option value="">Select...</option>
+              {gates.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </select>
+          </div>
         </div>
         <div style={{ display: 'flex', gap: 10 }}>
           <button type="button" onClick={onCancel} style={{ ...btnBase, background: 'rgba(255,255,255,0.07)', color: '#9ca3af' }}>Cancel</button>
@@ -216,6 +343,7 @@ export default function CampusMap() {
   const gateMarkersRef = useRef({});
   const userMarkerRef = useRef(null);
   const pendingDrawType = useRef(null);
+  const fileInputRef = useRef(null);
 
   const { toasts, add: toast, remove: removeToast } = useToast();
 
@@ -320,13 +448,21 @@ export default function CampusMap() {
       });
     });
 
-    // Click on map for gate placement
+    // Click on map for gate placement or entry point
     map.on('click', e => {
       if (pendingDrawType.current === 'gate') {
         const { lng, lat } = e.lngLat;
         setModal({ type: 'gate', lngLat: { lng, lat } });
         pendingDrawType.current = null;
         mapContainer.current.style.cursor = '';
+      } else if (pendingDrawType.current && pendingDrawType.current.startsWith('entry-point-')) {
+        const parkingId = pendingDrawType.current.replace('entry-point-', '');
+        const { lng, lat } = e.lngLat;
+        setParkingAreas(prev => prev.map(p => p.id === parkingId ? { ...p, entryPoint: { lng, lat } } : p));
+        pendingDrawType.current = null;
+        mapContainer.current.style.cursor = '';
+        setActiveTool('select');
+        toast('Parking entry point set!', 'success');
       }
     });
 
@@ -390,8 +526,20 @@ export default function CampusMap() {
       map.addLayer({ id: 'routes-line', type: 'line', source: 'routes-src', paint: { 'line-color': '#94a3b8', 'line-width': 2, 'line-dasharray': [4, 4] } });
     }
 
-    // ── Nav route ─────────────────────────────────────────────────────────
-    // Handled separately in navigation effect
+    // ── Parking Entry Points ───────────────────────────────────────────────
+    const pointsGeoJSON = {
+      type: 'FeatureCollection',
+      features: parkingAreas.filter(p => p.entryPoint).map(p => ({
+        type: 'Feature', id: `ep-${p.id}`, properties: {},
+        geometry: { type: 'Point', coordinates: [p.entryPoint.lng, p.entryPoint.lat] }
+      }))
+    };
+    if (map.getSource('pts-src')) {
+      map.getSource('pts-src').setData(pointsGeoJSON);
+    } else {
+      map.addSource('pts-src', { type: 'geojson', data: pointsGeoJSON });
+      map.addLayer({ id: 'pts-layer', type: 'circle', source: 'pts-src', paint: { 'circle-radius': 6, 'circle-color': '#f59e0b', 'circle-stroke-width': 2, 'circle-stroke-color': '#000' } });
+    }
 
   }, [parkingAreas, routes]);
 
@@ -473,9 +621,29 @@ export default function CampusMap() {
       userMarkerRef.current = new mapboxgl.Marker({ element: el })
         .setLngLat([lng, lat])
         .addTo(mapRef.current);
-      toast('Live location found!', 'success');
+      toast('Live location found! Calculating route...', 'success');
+
+      setSelectedEntry(null);
+      const ranked = parkingAreas.map(z => {
+        let center = centroidOfPolygon(z.coords);
+        if (z.entryPoint) center = [z.entryPoint.lng, z.entryPoint.lat];
+        else if (z.entryGate) {
+          const eg = gates.find(g => g.id === z.entryGate);
+          if (eg) center = [eg.lng, eg.lat];
+        }
+        const path = findShortestDrawnPath([lng, lat], center, routes);
+        let dist = 0;
+        for (let i = 0; i < path.length - 1; i++) dist += lngLatDist(path[i], path[i + 1]);
+        const score = (z.occupied / z.total) * 1000 + dist / 10;
+        return { ...z, score, dist: Math.round(dist) };
+      }).sort((a, b) => a.score - b.score);
+
+      if (ranked.length > 0) {
+        setRecommendations(ranked.slice(0, 3));
+        setNavTarget(ranked[0]);
+      }
     }, () => toast('Could not get location', 'error'));
-  }, [toast]);
+  }, [toast, parkingAreas, gates, routes]);
 
   // ── Navigation Route on Map ────────────────────────────────────────────────
   useEffect(() => {
@@ -487,36 +655,21 @@ export default function CampusMap() {
     });
     if (map.getSource('nav-src')) map.removeSource('nav-src');
 
-    if (!selectedEntry || !navTarget) return;
+    if (!navTarget || (!selectedEntry && !userLocation)) return;
 
-    // Build simple route: gate → centroid of target parking
-    let gatePt = [selectedEntry.lng, selectedEntry.lat];
+    // Build simple route from start to target
+    let startPt = selectedEntry ? [selectedEntry.lng, selectedEntry.lat] : [userLocation.lng, userLocation.lat];
 
-    // If the parking area has a defined entry gate, calculate route from the user's gate to the parking's entry gate
     let targetCenter = centroidOfPolygon(navTarget.coords);
-    if (navTarget.entryGate) {
+    if (navTarget.entryPoint) {
+      targetCenter = [navTarget.entryPoint.lng, navTarget.entryPoint.lat];
+    } else if (navTarget.entryGate) {
       const eg = gates.find(g => g.id === navTarget.entryGate);
       if (eg) targetCenter = [eg.lng, eg.lat];
     }
 
-    // If the user's location is known, start from there instead of the entry gate
-    if (userLocation) {
-      gatePt = [userLocation.lng, userLocation.lat];
-    }
-
-    // Find closest route point to connect through road network
-    let closestOnRoute = null;
-    let minD = Infinity;
-    routes.forEach(r => {
-      r.coords.forEach(pt => {
-        const d = lngLatDist(gatePt, pt);
-        if (d < minD) { minD = d; closestOnRoute = pt; }
-      });
-    });
-
-    const navCoords = closestOnRoute
-      ? [gatePt, closestOnRoute, ...routes[0]?.coords || [], targetCenter]
-      : [gatePt, targetCenter];
+    // Calculate perfect direction using only the drawn premises routes
+    const navCoords = findShortestDrawnPath(startPt, targetCenter, routes);
 
     const navGeoJSON = { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: navCoords } };
     const dist = Math.round(navCoords.reduce((acc, pt, i) => i === 0 ? acc : acc + lngLatDist(navCoords[i - 1], pt), 0));
@@ -537,15 +690,19 @@ export default function CampusMap() {
     map.fitBounds([[Math.min(...lngs) - 0.001, Math.min(...lats) - 0.001], [Math.max(...lngs) + 0.001, Math.max(...lats) + 0.001]], { padding: 80, duration: 1200 });
   }, [selectedEntry, navTarget, routes]);
 
-  // Animate nav dash
+  // Animate nav dash and twinkle glow
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
     let step = 0;
     const animate = () => {
-      step = (step + 1) % 32;
+      step = (step + 1) % 64;
       if (map.getLayer('nav-dash')) {
-        map.setPaintProperty('nav-dash', 'line-dasharray', [0.0001, 4 - (step * 0.05), 3 + (step * 0.05)]);
+        map.setPaintProperty('nav-dash', 'line-dasharray', [0.0001, 4 - ((step % 32) * 0.05), 3 + ((step % 32) * 0.05)]);
+      }
+      if (map.getLayer('nav-glow')) {
+        map.setPaintProperty('nav-glow', 'line-opacity', 0.2 + 0.3 * Math.abs(Math.sin(step * 0.1)));
+        map.setPaintProperty('nav-glow', 'line-width', 16 + 6 * Math.sin(step * 0.15));
       }
       reqRef.current = requestAnimationFrame(animate);
     };
@@ -569,15 +726,22 @@ export default function CampusMap() {
   const handleGateClick = useCallback(gate => {
     setSelectedEntry(gate);
     const ranked = parkingAreas.map(z => {
-      const center = centroidOfPolygon(z.coords);
-      const dist = lngLatDist([gate.lng, gate.lat], center);
+      let center = centroidOfPolygon(z.coords);
+      if (z.entryPoint) center = [z.entryPoint.lng, z.entryPoint.lat];
+      else if (z.entryGate) {
+        const eg = gates.find(g => g.id === z.entryGate);
+        if (eg) center = [eg.lng, eg.lat];
+      }
+      const path = findShortestDrawnPath([gate.lng, gate.lat], center, routes);
+      let dist = 0;
+      for (let i = 0; i < path.length - 1; i++) dist += lngLatDist(path[i], path[i + 1]);
       const score = (z.occupied / z.total) * 1000 + dist / 10;
-      return { ...z, score, dist };
+      return { ...z, score, dist: Math.round(dist) };
     }).sort((a, b) => a.score - b.score);
     setRecommendations(ranked.slice(0, 3));
     setNavTarget(ranked[0]);
     toast(`Routing from ${gate.name}`, 'success');
-  }, [parkingAreas, toast]);
+  }, [parkingAreas, toast, gates, routes]);
 
   const resetNav = () => {
     setSelectedEntry(null);
@@ -618,11 +782,11 @@ export default function CampusMap() {
   }, [toast]);
 
   // ── Modal Confirm Handlers ────────────────────────────────────────────────
-  const confirmParking = useCallback(({ name, totalSlots, entryGate }) => {
+  const confirmParking = useCallback(({ name, totalSlots, entryGate, exitGate }) => {
     const feature = modal?.feature;
     if (!feature) return;
     const id = feature.id || `pa-${Date.now()}`;
-    setParkingAreas(prev => [...prev.filter(p => p.id !== id), { id, name, coords: feature.geometry.coordinates, total: totalSlots, occupied: 0, entryGate }]);
+    setParkingAreas(prev => [...prev.filter(p => p.id !== id), { id, name, coords: feature.geometry.coordinates, total: totalSlots, occupied: 0, entryGate, exitGate }]);
     drawRef.current?.add(feature);
     setModal(null);
     setActiveTool('select');
@@ -660,6 +824,46 @@ export default function CampusMap() {
     const data = { parkingAreas, routes, gates };
     downloadData(data, 'mapData.json');
     toast('Map data downloaded as JSON!', 'success');
+  };
+
+  const triggerUpload = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const data = JSON.parse(event.target.result);
+        if (data.parkingAreas) setParkingAreas(data.parkingAreas);
+        if (data.routes) setRoutes(data.routes);
+        if (data.gates) setGates(data.gates);
+
+        if (drawRef.current) {
+          drawRef.current.deleteAll();
+          if (data.parkingAreas) {
+            data.parkingAreas.forEach(p => {
+              drawRef.current.add({ id: p.id, type: 'Feature', geometry: { type: 'Polygon', coordinates: p.coords } });
+            });
+          }
+          if (data.routes) {
+            data.routes.forEach(r => {
+              drawRef.current.add({ id: r.id, type: 'Feature', geometry: { type: 'LineString', coordinates: r.coords } });
+            });
+          }
+        }
+
+        toast('Map data uploaded successfully!', 'success');
+      } catch (err) {
+        console.error('Error parsing JSON:', err);
+        toast('Invalid JSON file.', 'error');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   };
 
   const totals = parkingAreas.reduce((acc, z) => { acc.total += z.total; acc.occ += z.occupied; return acc; }, { total: 0, occ: 0 });
@@ -805,9 +1009,24 @@ export default function CampusMap() {
                       <div style={{ fontSize: 11, color: '#64748b' }}>{z.total} slots</div>
                       <button onClick={() => deleteParking(z.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ef4444', padding: '2px' }}><Trash2 size={14} /></button>
                     </div>
-                    {/* Inline edit for entry gate */}
+                    {/* Inline edit for precise Entry Point */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
-                      <label style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase' }}>Entry:</label>
+                      <label style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', width: 65 }}>Entry Pt:</label>
+                      <button
+                        onClick={() => {
+                          pendingDrawType.current = `entry-point-${z.id}`;
+                          if (mapContainer.current) mapContainer.current.style.cursor = 'crosshair';
+                          setActiveTool(`entry-point-${z.id}`);
+                          toast('Click on the map to place the entry point for this parking.', 'info');
+                        }}
+                        style={{ flex: 1, background: z.entryPoint ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.06)', border: `1px solid ${z.entryPoint ? 'rgba(16,185,129,0.4)' : 'rgba(255,255,255,0.1)'}`, borderRadius: 6, padding: '4px 8px', color: z.entryPoint ? '#10b981' : '#fff', fontSize: 11, cursor: 'pointer', textAlign: 'center' }}
+                      >
+                        {z.entryPoint ? '📍 Point Set (Click to replace)' : '📍 Pick Point on Map'}
+                      </button>
+                    </div>
+                    {/* Inline edit for entry and exit gate */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                      <label style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', width: 65 }}>Gate In:</label>
                       <select
                         value={z.entryGate || ''}
                         onChange={e => {
@@ -817,7 +1036,22 @@ export default function CampusMap() {
                         }}
                         style={{ flex: 1, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, padding: '4px 8px', color: '#fff', fontSize: 11, outline: 'none' }}
                       >
-                        <option value="">Nearest point</option>
+                        <option value="">None (Use Center)</option>
+                        {gates.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+                      </select>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                      <label style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', width: 65 }}>Gate Out:</label>
+                      <select
+                        value={z.exitGate || ''}
+                        onChange={e => {
+                          const newGate = e.target.value;
+                          setParkingAreas(prev => prev.map(p => p.id === z.id ? { ...p, exitGate: newGate } : p));
+                          toast(`Updated exit gate for ${z.name}`, 'success');
+                        }}
+                        style={{ flex: 1, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, padding: '4px 8px', color: '#fff', fontSize: 11, outline: 'none' }}
+                      >
+                        <option value="">None (Use Center)</option>
                         {gates.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
                       </select>
                     </div>
@@ -881,6 +1115,8 @@ export default function CampusMap() {
                 <TBtn icon={<MapPin size={16} />} label="Gate" active={activeTool === 'add-gate'} onClick={() => activateTool('add-gate')} color="#f59e0b" />
                 <div style={{ width: 1, height: 28, background: 'rgba(255,255,255,0.1)' }} />
                 <TBtn icon={<Save size={16} />} label="Download JSON" active={false} onClick={saveMapData} color="#8b5cf6" />
+                <TBtn icon={<UploadCloud size={16} />} label="Upload JSON" active={false} onClick={triggerUpload} color="#ec4899" />
+                <input type="file" accept=".json" style={{ display: 'none' }} ref={fileInputRef} onChange={handleFileUpload} />
                 <TBtn icon={<CheckCircle size={16} />} label="Done" active={false} onClick={() => { setIsEditMode(false); setActiveTool('select'); activateTool('select'); }} color="#10b981" />
               </div>
             )}
