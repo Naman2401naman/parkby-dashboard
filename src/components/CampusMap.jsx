@@ -1,14 +1,17 @@
-﻿import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import mapboxgl from 'mapbox-gl';
 import MapboxDraw from '@mapbox/mapbox-gl-draw';
 import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 import 'mapbox-gl/dist/mapbox-gl.css';
+import * as turf from '@turf/turf';
 import {
   Navigation, Navigation2, Compass, Activity, Edit3, Settings2,
   MapPin, Route, Trash2, Save, MousePointer2, PlusCircle,
   ChevronLeft, X, Clock, Milestone, ArrowUpCircle, ZoomIn, ZoomOut,
-  CheckCircle, AlertTriangle, Info, MapPinned, LocateFixed, UploadCloud
+  CheckCircle, AlertTriangle, Info, MapPinned, LocateFixed, UploadCloud,
+  Square, Maximize2, FlipHorizontal2, FlipVertical2, RotateCcw, RotateCw, Minus, Plus
 } from 'lucide-react';
+import DrawRectangle, { scalePolygon, flipHorizontal, flipVertical, rotatePolygon } from '../utils/drawRectangle';
 
 // ─── Token ────────────────────────────────────────────────────────────────────
 const TOKEN = import.meta.env.VITE_MAPBOX_TOKEN;
@@ -280,6 +283,29 @@ function ParkingModal({ onConfirm, onCancel, gates }) {
   );
 }
 
+// ─── Update Occupancy Modal ──────────────────────────────────────────────────
+function UpdateOccupancyModal({ area, onConfirm, onCancel }) {
+  const [occupied, setOccupied] = useState(area.occupied.toString());
+  const ref = useRef();
+  useEffect(() => { ref.current?.focus(); }, []);
+  return (
+    <ModalShell title={`🔢 Update Slots: ${area.name}`} onClose={onCancel}>
+      <div style={{ marginBottom: 14 }}>
+        <label style={lStyle}>Total Configured Slots: {area.total}</label>
+      </div>
+      <div style={{ marginBottom: 22 }}>
+        <label style={lStyle}>Currently Occupied</label>
+        <input ref={ref} style={iStyle} type="number" min={0} max={area.total} value={occupied} onChange={e => setOccupied(e.target.value)}
+          placeholder={`e.g. ${Math.min(30, area.total)}`} onKeyDown={e => { if (e.key === 'Enter') onConfirm(parseInt(occupied) || 0); }} />
+      </div>
+      <div style={{ display: 'flex', gap: 10 }}>
+        <button type="button" onClick={onCancel} style={{ ...btnBase, background: 'rgba(255,255,255,0.07)', color: '#9ca3af' }}>Cancel</button>
+        <button type="button" onClick={() => onConfirm(parseInt(occupied) || 0)} style={{ ...btnBase, background: '#10b981', color: '#000' }}>Save Occupancy →</button>
+      </div>
+    </ModalShell>
+  );
+}
+
 // ─── Route Modal ─────────────────────────────────────────────────────────────
 function RouteModal({ onConfirm, onCancel }) {
   const [name, setName] = useState('');
@@ -377,6 +403,30 @@ export default function CampusMap() {
   // Modals
   const [modal, setModal] = useState(null); // { type: 'parking'|'route'|'gate', feature?, lngLat? }
 
+  // ── Event Listeners for Map Popups ─────────────────────────────────────────
+  const parkingAreasRef = useRef(parkingAreas);
+  useEffect(() => { parkingAreasRef.current = parkingAreas; }, [parkingAreas]);
+
+  const handleParkingNavClickRef = useRef(null);
+
+  useEffect(() => {
+    const handleUpdate = (e) => {
+      const area = parkingAreasRef.current.find(p => p.id === e.detail);
+      if (area) setModal({ type: 'update-occupancy', area });
+    };
+    const handleNavClick = (e) => {
+      const area = parkingAreasRef.current.find(p => p.id === e.detail);
+      if (area && handleParkingNavClickRef.current) handleParkingNavClickRef.current(area);
+    };
+
+    window.addEventListener('update-parking', handleUpdate);
+    window.addEventListener('navigate-parking', handleNavClick);
+    return () => {
+      window.removeEventListener('update-parking', handleUpdate);
+      window.removeEventListener('navigate-parking', handleNavClick);
+    };
+  }, []);
+
   // ── Init Map ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!TOKEN || mapRef.current) return;
@@ -396,6 +446,10 @@ export default function CampusMap() {
     const draw = new MapboxDraw({
       displayControlsDefault: false,
       controls: {},
+      modes: {
+        ...MapboxDraw.modes,
+        draw_rectangle: DrawRectangle
+      },
       styles: [
         { id: 'gl-draw-polygon-fill-inactive', type: 'fill', filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon'], ['!=', 'mode', 'static']], paint: { 'fill-color': '#10b981', 'fill-outline-color': '#10b981', 'fill-opacity': 0.25 } },
         { id: 'gl-draw-polygon-fill-active', type: 'fill', filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']], paint: { 'fill-color': '#10b981', 'fill-outline-color': '#10b981', 'fill-opacity': 0.35 } },
@@ -473,40 +527,39 @@ export default function CampusMap() {
     };
   }, []);
 
+  // ── Helper: clip a polygon to a percentage (left-to-right fill) ──────────
+  const clipPolygonToPercent = useCallback((coords, pct) => {
+    try {
+      const polygon = turf.polygon(coords);
+      const bbox = turf.bbox(polygon);
+      const [minX, minY, maxX, maxY] = bbox;
+      const fillX = minX + (maxX - minX) * Math.min(Math.max(pct, 0), 1);
+
+      // Create clip rectangle covering the filled portion (left side)
+      const pad = 0.0001;
+      const clipRect = turf.polygon([[
+        [minX - pad, minY - pad],
+        [fillX, minY - pad],
+        [fillX, maxY + pad],
+        [minX - pad, maxY + pad],
+        [minX - pad, minY - pad]
+      ]]);
+
+      const clipped = turf.intersect(turf.featureCollection([polygon, clipRect]));
+      return clipped ? clipped.geometry.coordinates : null;
+    } catch (e) {
+      return null;
+    }
+  }, []);
+
   // ── Render all layers whenever data changes ───────────────────────────────
   const renderAllLayers = useCallback((m) => {
     const map = m || mapRef.current;
     if (!map || !map.isStyleLoaded()) return;
 
-    // ── Parking areas ──────────────────────────────────────────────────────
-    const parkingGeoJSON = {
-      type: 'FeatureCollection',
-      features: parkingAreas.map(z => ({
-        type: 'Feature', id: z.id,
-        properties: { id: z.id, name: z.name, color: statusColor(z.occupied, z.total), occupied: z.occupied, total: z.total, pct: z.total ? Math.round(z.occupied / z.total * 100) : 0 },
-        geometry: { type: 'Polygon', coordinates: z.coords }
-      }))
-    };
-
-    if (map.getSource('parking-src')) {
-      map.getSource('parking-src').setData(parkingGeoJSON);
-    } else {
-      map.addSource('parking-src', { type: 'geojson', data: parkingGeoJSON });
-      map.addLayer({ id: 'parking-fill', type: 'fill', source: 'parking-src', paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0.3 } });
-      map.addLayer({ id: 'parking-border', type: 'line', source: 'parking-src', paint: { 'line-color': ['get', 'color'], 'line-width': 2.5, 'line-opacity': 0.9 } });
-      map.addLayer({ id: 'parking-label', type: 'symbol', source: 'parking-src', layout: { 'text-field': ['concat', ['get', 'name'], '\n', ['get', 'pct'], '%'], 'text-size': 12, 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'] }, paint: { 'text-color': '#fff', 'text-halo-color': '#000', 'text-halo-width': 2 } });
-
-      map.on('click', 'parking-fill', e => {
-        if (!e.features?.[0]) return;
-        const p = e.features[0].properties;
-        new mapboxgl.Popup({ closeButton: false, className: 'park-popup' })
-          .setLngLat(e.lngLat)
-          .setHTML(`<div style="color:#000;padding:6px 8px;font-family:sans-serif"><b>${p.name}</b><br/>${p.occupied}/${p.total} occupied — <b>${p.pct}% full</b></div>`)
-          .addTo(map);
-      });
-    }
-
-    // ── Routes ─────────────────────────────────────────────────────────────
+    // =============================================
+    // 1. ROUTES FIRST (bottom z-layer) — Premium Road Presentation
+    // =============================================
     const routeGeoJSON = {
       type: 'FeatureCollection',
       features: routes.map(r => ({
@@ -516,14 +569,186 @@ export default function CampusMap() {
       }))
     };
 
+    // Generate arrow point features along routes for directional indicators
+    const arrowFeatures = [];
+    routes.forEach(r => {
+      if (r.coords.length < 2) return;
+      for (let i = 0; i < r.coords.length - 1; i++) {
+        const a = r.coords[i], b = r.coords[i + 1];
+        const midLng = (a[0] + b[0]) / 2;
+        const midLat = (a[1] + b[1]) / 2;
+        const angle = Math.atan2(b[1] - a[1], b[0] - a[0]) * (180 / Math.PI);
+        arrowFeatures.push({
+          type: 'Feature',
+          properties: { bearing: 90 - angle },
+          geometry: { type: 'Point', coordinates: [midLng, midLat] }
+        });
+      }
+    });
+    const arrowGeoJSON = { type: 'FeatureCollection', features: arrowFeatures };
+
     if (map.getSource('routes-src')) {
       map.getSource('routes-src').setData(routeGeoJSON);
     } else {
       map.addSource('routes-src', { type: 'geojson', data: routeGeoJSON });
-      // Road base
-      map.addLayer({ id: 'routes-bg', type: 'line', source: 'routes-src', paint: { 'line-color': '#334155', 'line-width': 18, 'line-blur': 1, 'line-opacity': 0.9 } });
-      // Road surface with dash
-      map.addLayer({ id: 'routes-line', type: 'line', source: 'routes-src', paint: { 'line-color': '#94a3b8', 'line-width': 2, 'line-dasharray': [4, 4] } });
+      // Road outer shadow (gives the road depth)
+      map.addLayer({
+        id: 'routes-shadow', type: 'line', source: 'routes-src',
+        paint: { 'line-color': '#000000', 'line-width': 28, 'line-blur': 6, 'line-opacity': 0.4 },
+        layout: { 'line-cap': 'round', 'line-join': 'round' }
+      });
+      // Road surface (dark asphalt)
+      map.addLayer({
+        id: 'routes-bg', type: 'line', source: 'routes-src',
+        paint: { 'line-color': '#1a2535', 'line-width': 22, 'line-blur': 0, 'line-opacity': 0.95 },
+        layout: { 'line-cap': 'round', 'line-join': 'round' }
+      });
+      // Road edge lines (curb indicator)
+      map.addLayer({
+        id: 'routes-edge', type: 'line', source: 'routes-src',
+        paint: { 'line-color': '#334155', 'line-width': 24, 'line-blur': 0, 'line-opacity': 0.6, 'line-gap-width': 0 },
+        layout: { 'line-cap': 'round', 'line-join': 'round' }
+      });
+      // Subtle neon glow along road
+      map.addLayer({
+        id: 'routes-glow', type: 'line', source: 'routes-src',
+        paint: { 'line-color': '#14b8a6', 'line-width': 18, 'line-blur': 12, 'line-opacity': 0.18 },
+        layout: { 'line-cap': 'round', 'line-join': 'round' }
+      });
+      // Center lane dashes (white lane markings)
+      map.addLayer({
+        id: 'routes-lane', type: 'line', source: 'routes-src',
+        paint: { 'line-color': '#475569', 'line-width': 1.5, 'line-dasharray': [4, 6], 'line-opacity': 0.6 },
+        layout: { 'line-cap': 'butt', 'line-join': 'round' }
+      });
+      // Bright accent line on top (subtle teal highlight)
+      map.addLayer({
+        id: 'routes-line', type: 'line', source: 'routes-src',
+        paint: { 'line-color': '#2dd4bf', 'line-width': 2, 'line-dasharray': [1, 4], 'line-opacity': 0.35 },
+        layout: { 'line-cap': 'round', 'line-join': 'round' }
+      });
+      // Route name labels
+      map.addLayer({
+        id: 'routes-label', type: 'symbol', source: 'routes-src',
+        layout: {
+          'text-field': ['get', 'name'], 'text-size': 11,
+          'symbol-placement': 'line', 'text-offset': [0, -1.6],
+          'text-font': ['DIN Pro Medium', 'Arial Unicode MS Regular'],
+          'text-allow-overlap': false, 'text-ignore-placement': false
+        },
+        paint: { 'text-color': '#a5f3fc', 'text-halo-color': '#0f172a', 'text-halo-width': 2.5 }
+      });
+    }
+
+    // Directional arrows along routes
+    if (map.getSource('routes-arrows-src')) {
+      map.getSource('routes-arrows-src').setData(arrowGeoJSON);
+    } else {
+      map.addSource('routes-arrows-src', { type: 'geojson', data: arrowGeoJSON });
+      map.addLayer({
+        id: 'routes-arrows', type: 'symbol', source: 'routes-arrows-src',
+        layout: {
+          'text-field': '▸',
+          'text-size': 18,
+          'text-rotate': ['get', 'bearing'],
+          'text-rotation-alignment': 'map',
+          'text-allow-overlap': true,
+          'text-ignore-placement': true,
+          'text-font': ['DIN Pro Bold', 'Arial Unicode MS Bold']
+        },
+        paint: { 'text-color': '#14b8a6', 'text-opacity': 0.5 }
+      });
+    }
+
+    // =============================================
+    // 2. PARKING AREAS ON TOP (above routes)
+    // =============================================
+    const parkingGeoJSON = {
+      type: 'FeatureCollection',
+      features: parkingAreas.map(z => ({
+        type: 'Feature', id: z.id,
+        properties: {
+          id: z.id, name: z.name,
+          color: statusColor(z.occupied, z.total),
+          borderColor: statusColor(z.occupied, z.total),
+          occupied: z.occupied, total: z.total,
+          pct: z.total ? Math.round(z.occupied / z.total * 100) : 0
+        },
+        geometry: { type: 'Polygon', coordinates: z.coords }
+      }))
+    };
+
+    const filledFeatures = parkingAreas.map(z => {
+      const pct = z.total ? z.occupied / z.total : 0;
+      if (pct <= 0) return null;
+      const clippedCoords = clipPolygonToPercent(z.coords, pct);
+      if (!clippedCoords) return null;
+      return {
+        type: 'Feature',
+        properties: { color: statusColor(z.occupied, z.total) },
+        geometry: { type: 'Polygon', coordinates: clippedCoords }
+      };
+    }).filter(Boolean);
+    const filledGeoJSON = { type: 'FeatureCollection', features: filledFeatures };
+
+    if (map.getSource('parking-src')) {
+      map.getSource('parking-src').setData(parkingGeoJSON);
+    } else {
+      map.addSource('parking-src', { type: 'geojson', data: parkingGeoJSON });
+      map.addLayer({
+        id: 'parking-bg', type: 'fill', source: 'parking-src',
+        paint: { 'fill-color': '#1a2332', 'fill-opacity': 0.85 }
+      });
+      map.addLayer({
+        id: 'parking-border', type: 'line', source: 'parking-src',
+        paint: { 'line-color': ['get', 'borderColor'], 'line-width': 2.5, 'line-opacity': 0.8 }
+      });
+
+      map.on('click', 'parking-bg', e => {
+        if (!e.features?.[0]) return;
+        const p = e.features[0].properties;
+        new mapboxgl.Popup({ closeButton: false, className: 'park-popup' })
+          .setLngLat(e.lngLat)
+          .setHTML(`<div style="color:#000;padding:6px 8px;font-family:sans-serif;min-width:140px;">
+            <b style="font-size:14px">${p.name}</b><br/>
+            <div style="margin:4px 0;">${p.occupied} / ${p.total} occupied — <b>${p.pct}% full</b></div>
+            <button onclick="window.dispatchEvent(new CustomEvent('update-parking', {detail: '${p.id}'}))" 
+              style="margin-top:6px; width:100%; padding:6px; font-size:12px; cursor:pointer; background:#10b981; border:none; border-radius:6px; color:#fff; font-weight:bold;">
+              Update Slots
+            </button>
+            <button onclick="window.dispatchEvent(new CustomEvent('navigate-parking', {detail: '${p.id}'}))" 
+              style="margin-top:4px; width:100%; padding:6px; font-size:12px; cursor:pointer; background:#f59e0b; border:none; border-radius:6px; color:#000; font-weight:bold;">
+              Navigate Here
+            </button>
+          </div>`)
+          .addTo(map);
+      });
+    }
+
+    if (map.getSource('parking-fill-src')) {
+      map.getSource('parking-fill-src').setData(filledGeoJSON);
+    } else {
+      map.addSource('parking-fill-src', { type: 'geojson', data: filledGeoJSON });
+      map.addLayer({
+        id: 'parking-fill-level', type: 'fill', source: 'parking-fill-src',
+        paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0.75 }
+      });
+    }
+
+    if (!map.getSource('parking-label-src')) {
+      map.addSource('parking-label-src', { type: 'geojson', data: parkingGeoJSON });
+      map.addLayer({
+        id: 'parking-label', type: 'symbol', source: 'parking-label-src',
+        layout: {
+          'text-field': ['concat', ['get', 'name'], '\n', ['to-string', ['get', 'pct']], '%'],
+          'text-size': 11, 'text-font': ['DIN Pro Bold', 'Arial Unicode MS Bold'],
+          'text-transform': 'uppercase', 'text-letter-spacing': 0.05,
+          'text-line-height': 1.4, 'text-anchor': 'center', 'text-allow-overlap': true
+        },
+        paint: { 'text-color': '#fff', 'text-halo-color': '#000', 'text-halo-width': 2.5 }
+      });
+    } else {
+      map.getSource('parking-label-src').setData(parkingGeoJSON);
     }
 
     // ── Parking Entry Points ───────────────────────────────────────────────
@@ -538,10 +763,13 @@ export default function CampusMap() {
       map.getSource('pts-src').setData(pointsGeoJSON);
     } else {
       map.addSource('pts-src', { type: 'geojson', data: pointsGeoJSON });
-      map.addLayer({ id: 'pts-layer', type: 'circle', source: 'pts-src', paint: { 'circle-radius': 6, 'circle-color': '#f59e0b', 'circle-stroke-width': 2, 'circle-stroke-color': '#000' } });
+      map.addLayer({
+        id: 'pts-layer', type: 'circle', source: 'pts-src',
+        paint: { 'circle-radius': 6, 'circle-color': '#f59e0b', 'circle-stroke-width': 2, 'circle-stroke-color': '#000' }
+      });
     }
 
-  }, [parkingAreas, routes]);
+  }, [parkingAreas, routes, clipPolygonToPercent]);
 
   // Re-render layers when data changes
   useEffect(() => {
@@ -676,13 +904,29 @@ export default function CampusMap() {
     setNavInfo({ dist, direction: 'STRAIGHT' });
 
     map.addSource('nav-src', { type: 'geojson', data: navGeoJSON });
-    map.addLayer({ id: 'nav-glow', type: 'line', source: 'nav-src', paint: { 'line-color': '#10b981', 'line-width': 16, 'line-blur': 8, 'line-opacity': 0.25 } });
+    // Yellow/amber glow underneath (blinking)
+    map.addLayer({ id: 'nav-glow', type: 'line', source: 'nav-src', paint: { 'line-color': '#fbbf24', 'line-width': 22, 'line-blur': 12, 'line-opacity': 0.4 } });
+    // Yellow/amber dotted navigation line
     map.addLayer({
       id: 'nav-dash', type: 'line', source: 'nav-src', paint: {
-        'line-color': ['interpolate', ['linear'], ['line-progress'], 0, '#3b82f6', 1, '#10b981'],
-        'line-width': 5, 'line-opacity': 0.95,
-        'line-dasharray': [0, 4, 3]
+        'line-color': '#fbbf24',
+        'line-width': 5, 'line-opacity': 1,
+        'line-dasharray': [0.5, 2]
       }, layout: { 'line-cap': 'round', 'line-join': 'round' }
+    });
+
+    // Highlight target parking area (orange/amber contour)
+    const targetGeoJSON = {
+      type: 'Feature', geometry: { type: 'Polygon', coordinates: navTarget.coords }
+    };
+    map.addSource('nav-target-src', { type: 'geojson', data: targetGeoJSON });
+    map.addLayer({
+      id: 'nav-target-area-fill', type: 'fill', source: 'nav-target-src',
+      paint: { 'fill-color': '#f59e0b', 'fill-opacity': 0.25 }
+    });
+    map.addLayer({
+      id: 'nav-target-area-line', type: 'line', source: 'nav-target-src',
+      paint: { 'line-color': '#fbbf24', 'line-width': 4, 'line-opacity': 1 }
     });
 
     // Fly to fit
@@ -696,13 +940,24 @@ export default function CampusMap() {
     if (!map) return;
     let step = 0;
     const animate = () => {
-      step = (step + 1) % 64;
-      if (map.getLayer('nav-dash')) {
-        map.setPaintProperty('nav-dash', 'line-dasharray', [0.0001, 4 - ((step % 32) * 0.05), 3 + ((step % 32) * 0.05)]);
-      }
+      step = (step + 1) % 120;
+      const pulse = Math.abs(Math.sin(step * 0.1));
+      // Yellow glow blink effect
       if (map.getLayer('nav-glow')) {
-        map.setPaintProperty('nav-glow', 'line-opacity', 0.2 + 0.3 * Math.abs(Math.sin(step * 0.1)));
-        map.setPaintProperty('nav-glow', 'line-width', 16 + 6 * Math.sin(step * 0.15));
+        map.setPaintProperty('nav-glow', 'line-opacity', 0.15 + 0.45 * pulse);
+        map.setPaintProperty('nav-glow', 'line-width', 18 + 12 * Math.sin(step * 0.12));
+      }
+      // Nav dash blink
+      if (map.getLayer('nav-dash')) {
+        map.setPaintProperty('nav-dash', 'line-opacity', 0.7 + 0.3 * pulse);
+      }
+      // Target area blink
+      if (map.getLayer('nav-target-area-line')) {
+        map.setPaintProperty('nav-target-area-line', 'line-opacity', 0.5 + 0.5 * pulse);
+        map.setPaintProperty('nav-target-area-line', 'line-width', 3 + 2 * pulse);
+      }
+      if (map.getLayer('nav-target-area-fill')) {
+        map.setPaintProperty('nav-target-area-fill', 'fill-opacity', 0.1 + 0.2 * pulse);
       }
       reqRef.current = requestAnimationFrame(animate);
     };
@@ -711,16 +966,13 @@ export default function CampusMap() {
   }, []);
 
   // ── Live occupancy updates ─────────────────────────────────────────────────
+  // (Randomization disabled as per user request to allow manual updating)
   useEffect(() => {
-    if (isEditMode) return;
     const interval = setInterval(() => {
-      setParkingAreas(prev => prev.map(z => ({
-        ...z, occupied: Math.min(z.total, Math.max(0, z.occupied + Math.floor(Math.random() * 3) - 1))
-      })));
       setLastUpdate(new Date().toLocaleTimeString());
     }, 5000);
     return () => clearInterval(interval);
-  }, [isEditMode]);
+  }, []);
 
   // ── Handlers ──────────────────────────────────────────────────────────────
   const handleGateClick = useCallback(gate => {
@@ -743,14 +995,49 @@ export default function CampusMap() {
     toast(`Routing from ${gate.name}`, 'success');
   }, [parkingAreas, toast, gates, routes]);
 
+  // Navigate to a specific parking area (when clicked from sidebar or map popup)
+  const handleParkingNavClick = useCallback((area) => {
+    // Use selected gate, or default to first gate
+    let entry = selectedEntry;
+    if (!entry && gates.length > 0) {
+      entry = gates[0];
+      setSelectedEntry(entry);
+    }
+    if (!entry && !userLocation) {
+      toast('Please select an entrance gate first', 'warning');
+      return;
+    }
+    setNavTarget(area);
+    // Build recommendations from all parking areas
+    const startPt = entry ? [entry.lng, entry.lat] : [userLocation.lng, userLocation.lat];
+    const ranked = parkingAreas.map(z => {
+      let center = centroidOfPolygon(z.coords);
+      if (z.entryPoint) center = [z.entryPoint.lng, z.entryPoint.lat];
+      if (z.entryGate) {
+        const eg = gates.find(g => g.id === z.entryGate);
+        if (eg) center = [eg.lng, eg.lat];
+      }
+      const path = findShortestDrawnPath(startPt, center, routes);
+      let dist = 0;
+      for (let i = 0; i < path.length - 1; i++) dist += lngLatDist(path[i], path[i + 1]);
+      const score = (z.occupied / z.total) * 1000 + dist / 10;
+      return { ...z, score, dist: Math.round(dist) };
+    }).sort((a, b) => a.score - b.score);
+    setRecommendations(ranked.slice(0, 5));
+    toast(`Navigating to ${area.name}`, 'success');
+  }, [selectedEntry, userLocation, gates, parkingAreas, routes, toast]);
+
+  handleParkingNavClickRef.current = handleParkingNavClick;
+
   const resetNav = () => {
     setSelectedEntry(null);
     setNavTarget(null);
     setRecommendations([]);
     const map = mapRef.current;
     if (map) {
-      ['nav-glow', 'nav-dash'].forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
+      ['nav-glow', 'nav-dash', 'nav-target-area-fill', 'nav-target-area-line'].forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
       if (map.getSource('nav-src')) map.removeSource('nav-src');
+      if (map.getSource('nav-target-src')) map.removeSource('nav-target-src');
     }
   };
 
@@ -765,6 +1052,10 @@ export default function CampusMap() {
       pendingDrawType.current = 'parking';
       draw.changeMode('draw_polygon');
       toast('Click on map to draw parking area polygon. Double-click to finish.', 'info');
+    } else if (tool === 'draw-rect') {
+      pendingDrawType.current = 'parking';
+      draw.changeMode('draw_rectangle');
+      toast('Click first corner, then click opposite corner to draw rectangle parking area.', 'info');
     } else if (tool === 'draw-route') {
       pendingDrawType.current = 'route';
       draw.changeMode('draw_line_string');
@@ -781,7 +1072,30 @@ export default function CampusMap() {
     }
   }, [toast]);
 
+  // ── Transform Parking Areas (expand, flip, rotate) ─────────────────────────
+  const transformParking = useCallback((id, transformFn) => {
+    setParkingAreas(prev => prev.map(p => {
+      if (p.id !== id) return p;
+      const newCoords = transformFn(p.coords);
+      // Also update in MapboxDraw if edit mode
+      if (drawRef.current) {
+        try { drawRef.current.delete([id]); } catch(e) {}
+        drawRef.current.add({ id, type: 'Feature', geometry: { type: 'Polygon', coordinates: newCoords } });
+      }
+      return { ...p, coords: newCoords };
+    }));
+  }, []);
+
   // ── Modal Confirm Handlers ────────────────────────────────────────────────
+  const confirmUpdateOccupancy = useCallback((newOccupied) => {
+    if (!modal?.area) return;
+    const { area } = modal;
+    const validOccupied = Math.min(area.total, Math.max(0, newOccupied));
+    setParkingAreas(prev => prev.map(p => p.id === area.id ? { ...p, occupied: validOccupied } : p));
+    setModal(null);
+    toast(`Updated occupancy for ${area.name} to ${validOccupied}`, 'success');
+  }, [modal, toast]);
+
   const confirmParking = useCallback(({ name, totalSlots, entryGate, exitGate }) => {
     const feature = modal?.feature;
     if (!feature) return;
@@ -1003,12 +1317,36 @@ export default function CampusMap() {
               <div style={{ fontSize: 10, fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: 2, marginBottom: 12 }}>Parking Areas ({parkingAreas.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 20 }}>
                 {parkingAreas.map(z => (
-                  <div key={z.id} style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 12px', borderRadius: 12, background: 'rgba(16,185,129,0.07)', border: '1px solid rgba(16,185,129,0.15)' }}>
+                  <div key={z.id} style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '12px 14px', borderRadius: 14, background: 'rgba(16,185,129,0.07)', border: '1px solid rgba(16,185,129,0.15)', transition: 'all 0.2s' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <div style={{ flex: 1, fontSize: 13, fontWeight: 700 }}>{z.name}</div>
                       <div style={{ fontSize: 11, color: '#64748b' }}>{z.total} slots</div>
                       <button onClick={() => deleteParking(z.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ef4444', padding: '2px' }}><Trash2 size={14} /></button>
                     </div>
+
+                    {/* ── Transform Controls: Expand / Shrink / Flip / Rotate ── */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', marginTop: 2 }}>
+                      <div style={{ fontSize: 9, color: '#64748b', fontWeight: 800, textTransform: 'uppercase', letterSpacing: 1, width: '100%', marginBottom: 4 }}>Transform</div>
+                      {[
+                        { icon: <Plus size={12} />, tip: 'Expand 10%', fn: () => transformParking(z.id, (c) => scalePolygon(c, 1.1)), color: '#10b981' },
+                        { icon: <Minus size={12} />, tip: 'Shrink 10%', fn: () => transformParking(z.id, (c) => scalePolygon(c, 0.9)), color: '#f59e0b' },
+                        { icon: <FlipHorizontal2 size={12} />, tip: 'Flip H', fn: () => transformParking(z.id, flipHorizontal), color: '#3b82f6' },
+                        { icon: <FlipVertical2 size={12} />, tip: 'Flip V', fn: () => transformParking(z.id, flipVertical), color: '#8b5cf6' },
+                        { icon: <RotateCcw size={12} />, tip: 'Rotate -15°', fn: () => transformParking(z.id, (c) => rotatePolygon(c, -15)), color: '#ec4899' },
+                        { icon: <RotateCw size={12} />, tip: 'Rotate +15°', fn: () => transformParking(z.id, (c) => rotatePolygon(c, 15)), color: '#14b8a6' },
+                      ].map((b, i) => (
+                        <button key={i} title={b.tip} onClick={b.fn} style={{
+                          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+                          padding: '5px 8px', borderRadius: 8, border: `1px solid ${b.color}33`,
+                          background: `${b.color}15`, color: b.color, cursor: 'pointer',
+                          fontSize: 10, fontWeight: 700, transition: 'all 0.15s'
+                        }}>
+                          {b.icon}
+                          <span style={{ fontSize: 9 }}>{b.tip}</span>
+                        </button>
+                      ))}
+                    </div>
+
                     {/* Inline edit for precise Entry Point */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
                       <label style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', width: 65 }}>Entry Pt:</label>
@@ -1108,15 +1446,23 @@ export default function CampusMap() {
 
             {/* Edit tools */}
             {isEditMode && (
-              <div style={{ background: 'rgba(15,23,42,0.9)', backdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 20, padding: 10, display: 'flex', gap: 8, alignItems: 'center', animation: 'slideDown 0.3s ease-out' }}>
+              <div style={{ background: 'rgba(15,23,42,0.9)', backdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 20, padding: 10, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', animation: 'slideDown 0.3s ease-out' }}>
                 <TBtn icon={<MousePointer2 size={16} />} label="Select" active={activeTool === 'select'} onClick={() => activateTool('select')} color="#64748b" />
-                <TBtn icon={<PlusCircle size={16} />} label="Parking" active={activeTool === 'draw-parking'} onClick={() => activateTool('draw-parking')} color="#10b981" />
+                <TBtn icon={<PlusCircle size={16} />} label="Polygon" active={activeTool === 'draw-parking'} onClick={() => activateTool('draw-parking')} color="#10b981" />
+                <TBtn icon={<Square size={16} />} label="Rectangle" active={activeTool === 'draw-rect'} onClick={() => activateTool('draw-rect')} color="#22d3ee" />
                 <TBtn icon={<Route size={16} />} label="Route" active={activeTool === 'draw-route'} onClick={() => activateTool('draw-route')} color="#3b82f6" />
                 <TBtn icon={<MapPin size={16} />} label="Gate" active={activeTool === 'add-gate'} onClick={() => activateTool('add-gate')} color="#f59e0b" />
                 <div style={{ width: 1, height: 28, background: 'rgba(255,255,255,0.1)' }} />
-                <TBtn icon={<Save size={16} />} label="Download JSON" active={false} onClick={saveMapData} color="#8b5cf6" />
-                <TBtn icon={<UploadCloud size={16} />} label="Upload JSON" active={false} onClick={triggerUpload} color="#ec4899" />
+                <TBtn icon={<Save size={16} />} label="Download" active={false} onClick={saveMapData} color="#8b5cf6" />
+                <TBtn icon={<UploadCloud size={16} />} label="Upload" active={false} onClick={triggerUpload} color="#ec4899" />
                 <input type="file" accept=".json" style={{ display: 'none' }} ref={fileInputRef} onChange={handleFileUpload} />
+                <TBtn icon={<Trash2 size={16} />} label="Clear All" active={false} onClick={() => {
+                  if (window.confirm('Are you sure you want to delete all parking areas, routes, and gates? This cannot be undone.')) {
+                    setParkingAreas([]); setRoutes([]); setGates([]);
+                    if (drawRef.current) drawRef.current.deleteAll();
+                    toast('All map data cleared', 'warning');
+                  }
+                }} color="#ef4444" />
                 <TBtn icon={<CheckCircle size={16} />} label="Done" active={false} onClick={() => { setIsEditMode(false); setActiveTool('select'); activateTool('select'); }} color="#10b981" />
               </div>
             )}
@@ -1150,6 +1496,7 @@ export default function CampusMap() {
         {isEditMode && activeTool !== 'select' && (
           <div style={{ position: 'absolute', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 20, background: 'rgba(15,23,42,0.95)', border: '1px solid rgba(16,185,129,0.4)', borderRadius: 14, padding: '10px 24px', color: '#10b981', fontWeight: 700, fontSize: 13, backdropFilter: 'blur(12px)', whiteSpace: 'nowrap', animation: 'slideUp 0.3s ease-out' }}>
             {activeTool === 'draw-parking' && '📐 Click to draw polygon → double-click to finish'}
+            {activeTool === 'draw-rect' && '⬜ Click first corner → click opposite corner to create rectangle area'}
             {activeTool === 'draw-route' && '🛣️ Click to add points → double-click to finish route'}
             {activeTool === 'add-gate' && '🚪 Click anywhere on the map to place a gate'}
           </div>
@@ -1160,6 +1507,7 @@ export default function CampusMap() {
       </div>
 
       {/* ── Modals ──────────────────────────────────────────────────────────── */}
+      {modal?.type === 'update-occupancy' && <UpdateOccupancyModal area={modal.area} onConfirm={confirmUpdateOccupancy} onCancel={() => { setModal(null); setActiveTool('select'); }} />}
       {modal?.type === 'parking' && <ParkingModal gates={gates} onConfirm={confirmParking} onCancel={() => { drawRef.current?.delete([modal.feature?.id]); setModal(null); setActiveTool('select'); }} />}
       {modal?.type === 'route' && <RouteModal onConfirm={confirmRoute} onCancel={() => { drawRef.current?.delete([modal.feature?.id]); setModal(null); setActiveTool('select'); }} />}
       {modal?.type === 'gate' && <GateModal onConfirm={confirmGate} onCancel={() => { setModal(null); setActiveTool('select'); }} />}
