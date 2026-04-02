@@ -9,7 +9,9 @@ import {
   MapPin, Route, Trash2, Save, MousePointer2, PlusCircle,
   ChevronLeft, X, Clock, Milestone, ArrowUpCircle, ZoomIn, ZoomOut,
   CheckCircle, AlertTriangle, Info, MapPinned, LocateFixed, UploadCloud,
-  Square, Maximize2, FlipHorizontal2, FlipVertical2, RotateCcw, RotateCw, Minus, Plus
+  Square, Maximize2, FlipHorizontal2, FlipVertical2, RotateCcw, RotateCw, Minus, Plus,
+  Search, Car, PersonStanding, ArrowRight, ChevronDown, ChevronUp, CornerDownRight,
+  TrendingUp, Target, Layers
 } from 'lucide-react';
 import DrawRectangle, { scalePolygon, flipHorizontal, flipVertical, rotatePolygon } from '../utils/drawRectangle';
 
@@ -19,6 +21,13 @@ const TOKEN = import.meta.env.VITE_MAPBOX_TOKEN;
 // ─── Default campus center (Nagpur area) ──────────────────────────────────────
 const DEFAULT_CENTER = [79.0615, 21.1775];
 const DEFAULT_ZOOM = 17;
+// Real-world campus road entry point (Mapbox external route destination)
+const MAIN_GATE_COORDS = [79.05588, 21.15334]; // [lng, lat]
+const NAVIGATION_STATE = {
+  EXTERNAL_NAVIGATION: 'EXTERNAL_NAVIGATION',
+  INTERNAL_NAVIGATION: 'INTERNAL_NAVIGATION',
+  HYBRID_NAVIGATION: 'HYBRID_NAVIGATION',
+};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function statusColor(occ, total) {
@@ -395,13 +404,41 @@ export default function CampusMap() {
   const [selectedEntry, setSelectedEntry] = useState(null);
   const [navTarget, setNavTarget] = useState(null);
   const [recommendations, setRecommendations] = useState([]);
-  const [navInfo, setNavInfo] = useState({ dist: 0, direction: 'STRAIGHT' });
+  const [navInfo, setNavInfo] = useState({ dist: 0, durationSeconds: 0, direction: 'STRAIGHT' });
   const [lastUpdate, setLastUpdate] = useState(new Date().toLocaleTimeString());
   const [userLocation, setUserLocation] = useState(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
+  // ── Google Maps-style Search State ───────────────────────────────────────
+  const [gmSearch, setGmSearch] = useState({ fromText: 'Your Location', toText: '', toArea: null, showDropdown: false, showFromDropdown: false, travelMode: 'driving' });
+  const [directionsOpen, setDirectionsOpen] = useState(false);
+  const [navSteps, setNavSteps] = useState([]);
+  const [fromSuggestions, setFromSuggestions] = useState([]);
+  const fromInputRef = useRef(null);
+  const toInputRef = useRef(null);
+  const fromGeoTimerRef = useRef(null);
+
+  // ── Hybrid Navigation State ───────────────────────────────────────────────
+  // navPhase: null | 'outside' (Mapbox Directions) | 'inside' (custom drawn routes)
+  const [navPhase, setNavPhase] = useState(null);
+  // Added state manager requested by product flow.
+  const [navigationState, setNavigationState] = useState(null);
+  // officialRoute: the GeoJSON coords returned from Mapbox Directions API
+  const [officialRoute, setOfficialRoute] = useState(null);
+  // officialAlternatives: summary of Mapbox alternative routes (outside campus)
+  const [officialAlternatives, setOfficialAlternatives] = useState([]);
+  // proximity watch interval ref (polls every 5s for phase transition)
+  const proximityWatchRef = useRef(null);
+
   // Modals
   const [modal, setModal] = useState(null); // { type: 'parking'|'route'|'gate', feature?, lngLat? }
+
+  useEffect(() => {
+    if (navPhase === 'outside') setNavigationState(NAVIGATION_STATE.EXTERNAL_NAVIGATION);
+    else if (navPhase === 'inside') setNavigationState(NAVIGATION_STATE.INTERNAL_NAVIGATION);
+    else if (navPhase === 'both') setNavigationState(NAVIGATION_STATE.HYBRID_NAVIGATION);
+    else setNavigationState(null);
+  }, [navPhase]);
 
   // ── Event Listeners for Map Popups ─────────────────────────────────────────
   const parkingAreasRef = useRef(parkingAreas);
@@ -835,53 +872,402 @@ export default function CampusMap() {
     });
   }, [gates, selectedEntry, isEditMode]);
 
-  // ── User Location ─────────────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+  // ── HYBRID NAVIGATION HELPERS ─────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * detectMainEntrance — returns the gate whose name contains "Main" (case-insensitive)
+   * or the first gate if no such gate exists. Returns null when no gates are defined.
+   */
+  const detectMainEntrance = useCallback((gateList) => {
+    if (!gateList || gateList.length === 0) return null;
+    const main = gateList.find(g => /main/i.test(g.name));
+    return main || gateList[0];
+  }, []);
+
+  /**
+   * removeOfficialRouteLayers — removes Mapbox Directions route layers + sources
+   * from the map in a null-safe, order-safe manner.
+   */
+  const removeOfficialRouteLayers = useCallback(() => {
+    const map = mapRef.current;
+    if (!map || !map.isStyleLoaded()) return;
+    ['official-route-glow', 'official-route-line'].forEach(id => {
+      if (map.getLayer(id)) map.removeLayer(id);
+    });
+    if (map.getSource('official-route-src')) map.removeSource('official-route-src');
+  }, []);
+
+  /**
+   * startCustomNavigation — Phase 2 hand-off.
+   * Hides the official road route, then runs the existing custom route logic
+   * (findShortestDrawnPath) from the nearest gate to the best parking area.
+   *
+   * KEY FIX: Raw GPS coordinates often don't snap onto drawn campus routes,
+   * causing Dijkstra to fall back to a straight aerial line. To prevent this,
+   * we always start routing from the nearest gate's coordinates — gates are
+   * placed on the drawn route network and are guaranteed to snap cleanly.
+   * The user's live blue dot still shows their actual GPS position.
+   */
+  const startCustomNavigation = useCallback(
+    (userLng, userLat, currentGates, currentRoutes, currentParking, overrideEntry = null, overrideParking = null, keepExternalRoute = false) => {
+    if (!keepExternalRoute) removeOfficialRouteLayers();
+    setNavPhase(keepExternalRoute ? 'both' : 'inside');
+
+    // ── Determine routing origin ──────────────────────────────────────────────
+    // Prefer nearest gate as start (it's on the drawn route graph).
+    // Fall back to raw GPS only when no gates are defined at all.
+    let startPt = [userLng, userLat];
+    let nearestGate = null;
+
+    if (overrideEntry) {
+      nearestGate = overrideEntry;
+    }
+
+    if (!overrideEntry && currentGates.length > 0) {
+      nearestGate = currentGates.reduce((best, g) => {
+        const d = lngLatDist([userLng, userLat], [g.lng, g.lat]);
+        return d < best.dist ? { gate: g, dist: d } : best;
+      }, { gate: null, dist: Infinity }).gate;
+    }
+
+    if (nearestGate) {
+      startPt = [nearestGate.lng, nearestGate.lat];
+      // Highlight the chosen entry gate in the sidebar so user knows their start
+      setSelectedEntry(nearestGate);
+    }
+
+    // ── Rank all parking areas by score (occupancy + route distance) ──────────
+    const ranked = currentParking.map(z => {
+      let center = centroidOfPolygon(z.coords);
+      if (z.entryPoint) center = [z.entryPoint.lng, z.entryPoint.lat];
+      else if (z.entryGate) {
+        const eg = currentGates.find(g => g.id === z.entryGate);
+        if (eg) center = [eg.lng, eg.lat];
+      }
+      const path = findShortestDrawnPath(startPt, center, currentRoutes);
+      let dist = 0;
+      for (let i = 0; i < path.length - 1; i++) dist += lngLatDist(path[i], path[i + 1]);
+      const score = (z.occupied / (z.total || 1)) * 1000 + dist / 10;
+      return { ...z, score, dist: Math.round(dist) };
+    }).sort((a, b) => a.score - b.score);
+
+    if (ranked.length > 0) {
+      const best = ranked[0];
+      const finalTarget = overrideParking
+        ? (ranked.find(z => z.id === overrideParking.id) || best)
+        : best;
+
+      const baseTop = ranked.slice(0, 3);
+      const recommendationsTop = baseTop.some(z => z.id === finalTarget.id)
+        ? baseTop
+        : [finalTarget, ...ranked.filter(z => z.id !== finalTarget.id)].slice(0, 3);
+
+      setRecommendations(recommendationsTop);
+      setNavTarget(finalTarget);
+
+      // Build inside step-by-step (from drawn campus paths) so the directions panel
+      // always works for "location -> parking" navigation.
+      try {
+        let center = centroidOfPolygon(finalTarget.coords);
+        if (finalTarget.entryPoint) center = [finalTarget.entryPoint.lng, finalTarget.entryPoint.lat];
+        else if (finalTarget.entryGate) {
+          const eg = currentGates.find(g => g.id === finalTarget.entryGate);
+          if (eg) center = [eg.lng, eg.lat];
+        }
+
+        const path = findShortestDrawnPath(startPt, center, currentRoutes);
+        if (path && path.length > 1) {
+          const steps = [];
+          let accumulated = 0;
+
+          for (let i = 0; i < path.length - 1; i++) {
+            const segDist = Math.round(lngLatDist(path[i], path[i + 1]));
+            accumulated += segDist;
+
+            let bearing = 0;
+            if (i > 0) {
+              const v1x = path[i][0] - path[i - 1][0];
+              const v1y = path[i][1] - path[i - 1][1];
+              const v2x = path[i + 1][0] - path[i][0];
+              const v2y = path[i + 1][1] - path[i][1];
+              const cross = v1x * v2y - v1y * v2x;
+              const dot = v1x * v2x + v1y * v2y;
+              bearing = Math.atan2(cross, dot) * (180 / Math.PI);
+            }
+
+            let turn = 'Continue straight';
+            if (i === 0) turn = 'Start heading to destination';
+            else if (bearing > 20) turn = 'Turn left';
+            else if (bearing < -20) turn = 'Turn right';
+
+            if (i === 0 || Math.abs(bearing) > 20 || i === path.length - 2) {
+              steps.push({
+                instruction: i === path.length - 2 ? `Arrive at ${finalTarget.name}` : turn,
+                dist: accumulated
+              });
+              accumulated = 0;
+            }
+          }
+
+          if (steps.length === 0) {
+            steps.push({
+              instruction: `Head to ${finalTarget.name}`,
+              dist: Math.round(lngLatDist(startPt, center))
+            });
+          }
+
+          setNavSteps(steps);
+          setDirectionsOpen(true);
+          setNavInfo({ dist: Math.round(finalTarget.dist || 0), durationSeconds: 0, direction: 'STRAIGHT' });
+        }
+      } catch (e) {
+        console.warn('[HybridNav] Could not build inside steps:', e);
+      }
+    }
+
+    const gateName = nearestGate ? nearestGate.name : 'campus entry';
+    toast(`🏫 Campus navigation from ${gateName}`, 'success');
+  }, [removeOfficialRouteLayers, toast]);
+
+  /**
+   * getOfficialRouteToEntrance — Phase 1.
+   * Calls Mapbox Directions API (driving) from user location to target gate.
+   * On success, draws the blue glow + line layers and stores coords in state.
+   * On failure, gracefully falls back to custom navigation.
+   */
+  const getOfficialRouteToEntrance = useCallback(async (userLng, userLat, entranceGate, targetOverride = null) => {
+    const coordStr = `${userLng},${userLat};${entranceGate.lng},${entranceGate.lat}`;
+    const profile = gmSearch.travelMode === 'walking' ? 'walking' : 'driving-traffic';
+    const url = `https://api.mapbox.com/directions/v5/mapbox/${profile}/${coordStr}` +
+      `?geometries=geojson&overview=full&alternatives=true&steps=true&language=en&access_token=${TOKEN}`;
+
+    let routeCoords;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (!json.routes || json.routes.length === 0) throw new Error('No routes returned');
+
+      // store alternatives summary (for UI only)
+      const routes = json.routes;
+      setOfficialAlternatives(
+        routes.slice(0, 3).map(r => ({
+          distance: r.distance,
+          duration: r.duration
+        }))
+      );
+
+      const best = routes[0];
+      routeCoords = best.geometry.coordinates; // [[lng,lat], ...]
+
+      // Build step-by-step from Mapbox so the user gets a full navigation experience
+      const mbSteps = best.legs?.[0]?.steps || [];
+      const stripHtml = (s) => (typeof s === 'string' ? s.replace(/<[^>]*>/g, '') : '');
+      const steps = mbSteps.map((s) => ({
+        instruction: stripHtml(s?.maneuver?.instruction) || stripHtml(s?.name) || 'Continue',
+        dist: Math.round(s?.distance || 0)
+      }));
+      if (steps.length > 0) setNavSteps(steps);
+      setDirectionsOpen(true);
+
+      // Summary values
+      setNavInfo({
+        dist: Math.round(best.distance || 0),
+        durationSeconds: Math.round(best.duration || 0),
+        direction: 'STRAIGHT'
+      });
+    } catch (err) {
+      console.warn('[HybridNav] Mapbox Directions failed, falling back to custom nav:', err);
+      toast('Road route unavailable, using campus paths directly', 'warning');
+      // Fallback: skip Phase 1, jump straight to Phase 2
+      startCustomNavigation(userLng, userLat, gates, routes, parkingAreas, entranceGate, targetOverride || navTarget);
+      return;
+    }
+
+    // ── Draw official Mapbox route (blue glow) ────────────────────────────────
+    const map = mapRef.current;
+    if (!map || !map.isStyleLoaded()) return;
+
+    // Remove any stale layers first
+    removeOfficialRouteLayers();
+
+    const routeGeoJSON = {
+      type: 'Feature',
+      properties: {},
+      geometry: { type: 'LineString', coordinates: routeCoords }
+    };
+
+    map.addSource('official-route-src', { type: 'geojson', data: routeGeoJSON });
+    // Outer glow — wide + blurred blue
+    map.addLayer({
+      id: 'official-route-glow',
+      type: 'line',
+      source: 'official-route-src',
+      paint: {
+        'line-color': '#3b82f6',
+        'line-width': 20,
+        'line-blur': 14,
+        'line-opacity': 0.45
+      },
+      layout: { 'line-cap': 'round', 'line-join': 'round' }
+    });
+    // Main blue line on top
+    map.addLayer({
+      id: 'official-route-line',
+      type: 'line',
+      source: 'official-route-src',
+      paint: {
+        'line-color': '#60a5fa',
+        'line-width': 4,
+        'line-opacity': 1
+      },
+      layout: { 'line-cap': 'round', 'line-join': 'round' }
+    });
+
+    setOfficialRoute(routeCoords);
+    setNavPhase('outside');
+
+    // ── Also draw Phase 2 (internal campus route) simultaneously ─────────────
+    // This gives the full trip visualization: Source → Gate → Parking
+    // We use keepExternalRoute=true so the blue Phase 1 road is NOT cleared
+    const finalTarget = targetOverride || navTarget;
+    if (finalTarget) {
+      setTimeout(() => {
+        startCustomNavigation(
+          entranceGate.lng, entranceGate.lat,
+          gates, routes, parkingAreas,
+          entranceGate, finalTarget,
+          true /* keepExternalRoute — keep the blue road visible */
+        );
+      }, 200);
+    }
+
+    // Fit map to show full combined route (external road + campus area)
+    const allLngs = routeCoords.map(c => c[0]);
+    const allLats = routeCoords.map(c => c[1]);
+    // Also include campus gate coords so map fits both routes
+    allLngs.push(entranceGate.lng);
+    allLats.push(entranceGate.lat);
+    map.fitBounds(
+      [[Math.min(...allLngs) - 0.003, Math.min(...allLats) - 0.003],
+       [Math.max(...allLngs) + 0.003, Math.max(...allLats) + 0.003]],
+      { padding: 80, duration: 1400 }
+    );
+  }, [TOKEN, toast, startCustomNavigation, removeOfficialRouteLayers, gates, routes, parkingAreas, gmSearch.travelMode, navTarget]);
+
+  const applyUserLocation = useCallback((lng, lat, isLiveGps = true) => {
+    setUserLocation({ lng, lat });
+    // Keep current target or clear if it's just a general locate
+    // Actually the original locateUser clears them, then startCustomNavigation re-sets them
+    // So we preserve the original logic of clearing and resetting inside startCustomNavigation
+    const currentNavTarget = navTarget;
+    const currentSelectedEntry = selectedEntry;
+
+    // Place pulsing blue marker
+    if (userMarkerRef.current) userMarkerRef.current.remove();
+    const el = document.createElement('div');
+    el.style.cssText = [
+      'width:22px', 'height:22px', 'border-radius:50%',
+      'background:#3b82f6', 'border:3px solid #fff',
+      'box-shadow:0 0 0 6px rgba(59,130,246,0.28)',
+      'animation:locPulse 1.5s infinite'
+    ].join(';');
+    userMarkerRef.current = new mapboxgl.Marker({ element: el })
+      .setLngLat([lng, lat])
+      .addTo(mapRef.current);
+
+    // Check proximity to gates
+    if (gates.length === 0) {
+      toast(isLiveGps ? '📍 Location found! No gates defined — routing on campus paths.' : '📍 Address located! Routing...', 'info');
+      startCustomNavigation(lng, lat, gates, routes, parkingAreas, null, currentNavTarget);
+      return;
+    }
+
+    const minGateDist = Math.min(...gates.map(g => lngLatDist([lng, lat], [g.lng, g.lat])));
+    const CAMPUS_THRESHOLD_M = 750;
+
+    if (minGateDist <= CAMPUS_THRESHOLD_M) {
+      toast(isLiveGps ? '📍 Location found! You\'re near campus — starting internal navigation…' : '📍 Address located near campus — starting internal nav…', 'success');
+      startCustomNavigation(lng, lat, gates, routes, parkingAreas, currentSelectedEntry, currentNavTarget);
+    } else {
+      const entrance = currentSelectedEntry || detectMainEntrance(gates);
+      if (!entrance) {
+        toast('No entrance gate found, routing on campus paths…', 'warning');
+        startCustomNavigation(lng, lat, gates, routes, parkingAreas, currentSelectedEntry, currentNavTarget);
+      } else {
+        toast(`🚗 Following real roads to ${entrance.name}…`, 'info');
+        getOfficialRouteToEntrance(lng, lat, entrance, currentNavTarget);
+      }
+
+      // Proximity polling for automatic Phase 2 switch (only if using Live GPS)
+      if (proximityWatchRef.current) clearInterval(proximityWatchRef.current);
+      if (isLiveGps && navigator.geolocation) {
+        proximityWatchRef.current = setInterval(() => {
+          navigator.geolocation.getCurrentPosition(innerPos => {
+            const { longitude: iLng, latitude: iLat } = innerPos.coords;
+            const nearestGateDist = Math.min(...gates.map(g => lngLatDist([iLng, iLat], [g.lng, g.lat])));
+            if (nearestGateDist <= CAMPUS_THRESHOLD_M) {
+              clearInterval(proximityWatchRef.current);
+              proximityWatchRef.current = null;
+              userMarkerRef.current?.setLngLat([iLng, iLat]);
+              setUserLocation({ lng: iLng, lat: iLat });
+              startCustomNavigation(iLng, iLat, gates, routes, parkingAreas, currentSelectedEntry, currentNavTarget);
+            }
+          }, () => {});
+        }, 5000);
+      }
+    }
+  }, [toast, parkingAreas, gates, routes, detectMainEntrance, getOfficialRouteToEntrance, startCustomNavigation, selectedEntry, navTarget]);
+
   const locateUser = useCallback(() => {
     if (!navigator.geolocation) { toast('Geolocation not supported', 'warning'); return; }
     navigator.geolocation.getCurrentPosition(pos => {
-      const { longitude: lng, latitude: lat } = pos.coords;
-      setUserLocation({ lng, lat });
-      mapRef.current?.flyTo({ center: [lng, lat], zoom: 17, pitch: 30 });
+      applyUserLocation(pos.coords.longitude, pos.coords.latitude, true);
+    }, () => toast('Could not get location. Please allow location access.', 'error'));
+  }, [applyUserLocation, toast]);
 
-      if (userMarkerRef.current) userMarkerRef.current.remove();
-      const el = document.createElement('div');
-      el.style.cssText = `width:20px;height:20px;border-radius:50%;background:#3b82f6;border:3px solid #fff;box-shadow:0 0 0 6px rgba(59,130,246,0.25);animation:locPulse 1.5s infinite;`;
-      userMarkerRef.current = new mapboxgl.Marker({ element: el })
-        .setLngLat([lng, lat])
-        .addTo(mapRef.current);
-      toast('Live location found! Calculating route...', 'success');
+  const handleStartNavigation = useCallback(async () => {
+    if (!navTarget) return;
 
-      setSelectedEntry(null);
-      const ranked = parkingAreas.map(z => {
-        let center = centroidOfPolygon(z.coords);
-        if (z.entryPoint) center = [z.entryPoint.lng, z.entryPoint.lat];
-        else if (z.entryGate) {
-          const eg = gates.find(g => g.id === z.entryGate);
-          if (eg) center = [eg.lng, eg.lat];
-        }
-        const path = findShortestDrawnPath([lng, lat], center, routes);
-        let dist = 0;
-        for (let i = 0; i < path.length - 1; i++) dist += lngLatDist(path[i], path[i + 1]);
-        const score = (z.occupied / z.total) * 1000 + dist / 10;
-        return { ...z, score, dist: Math.round(dist) };
-      }).sort((a, b) => a.score - b.score);
+    if (!gmSearch.fromText || gmSearch.fromText.trim().toLowerCase() === 'your location') {
+      locateUser();
+      return;
+    }
 
-      if (ranked.length > 0) {
-        setRecommendations(ranked.slice(0, 3));
-        setNavTarget(ranked[0]);
+    try {
+      toast('Locating address...', 'info');
+      const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(gmSearch.fromText)}.json?access_token=${TOKEN}&limit=1`;
+      const res = await fetch(url);
+      const data = await res.json();
+      
+      if (!data.features || data.features.length === 0) {
+        toast('Address not found. Please try another.', 'error');
+        return;
       }
-    }, () => toast('Could not get location', 'error'));
-  }, [toast, parkingAreas, gates, routes]);
+      
+      const [lng, lat] = data.features[0].center;
+      applyUserLocation(lng, lat, false);
+    } catch (err) {
+      toast('Error finding address.', 'error');
+    }
+  }, [navTarget, gmSearch.fromText, locateUser, applyUserLocation, toast]);
 
   // ── Navigation Route on Map ────────────────────────────────────────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !map.isStyleLoaded()) return;
 
-    ['nav-glow', 'nav-dash', 'nav-dots'].forEach(id => {
+    ['nav-glow', 'nav-dash', 'nav-dots', 'nav-target-area-fill', 'nav-target-area-line'].forEach(id => {
       if (map.getLayer(id)) map.removeLayer(id);
     });
     if (map.getSource('nav-src')) map.removeSource('nav-src');
+    if (map.getSource('nav-target-src')) map.removeSource('nav-target-src');
+
+    // External route mode: show only the optimized road route (blue line),
+    // and suppress internal campus dashed path rendering.
+    if (navPhase === 'outside') return;
 
     if (!navTarget || (!selectedEntry && !userLocation)) return;
 
@@ -932,7 +1318,7 @@ export default function CampusMap() {
     // Fly to fit
     const lngs = navCoords.map(c => c[0]), lats = navCoords.map(c => c[1]);
     map.fitBounds([[Math.min(...lngs) - 0.001, Math.min(...lats) - 0.001], [Math.max(...lngs) + 0.001, Math.max(...lats) + 0.001]], { padding: 80, duration: 1200 });
-  }, [selectedEntry, navTarget, routes]);
+  }, [selectedEntry, navTarget, routes, navPhase]);
 
   // Animate nav dash and twinkle glow
   useEffect(() => {
@@ -1033,13 +1419,311 @@ export default function CampusMap() {
     setSelectedEntry(null);
     setNavTarget(null);
     setRecommendations([]);
+    setNavPhase(null);
+    setOfficialRoute(null);
+    setOfficialAlternatives([]);
+    setDirectionsOpen(false);
+    setNavSteps([]);
+    setGmSearch(s => ({ ...s, toText: '', toArea: null, showDropdown: false, showFromDropdown: false }));
+    setFromSuggestions([]);
+    // Clear proximity polling
+    if (proximityWatchRef.current) {
+      clearInterval(proximityWatchRef.current);
+      proximityWatchRef.current = null;
+    }
     const map = mapRef.current;
-    if (map) {
-      ['nav-glow', 'nav-dash', 'nav-target-area-fill', 'nav-target-area-line'].forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
+    if (map && map.isStyleLoaded()) {
+      // Remove custom nav layers
+      ['nav-glow', 'nav-dash', 'nav-dots', 'nav-target-area-fill', 'nav-target-area-line'].forEach(id => {
+        if (map.getLayer(id)) map.removeLayer(id);
+      });
       if (map.getSource('nav-src')) map.removeSource('nav-src');
       if (map.getSource('nav-target-src')) map.removeSource('nav-target-src');
+      // Remove official Mapbox route layers
+      removeOfficialRouteLayers();
     }
   };
+
+  // ── Google Maps search handlers ───────────────────────────────────────────
+
+  // handleFromInput: debounced Mapbox geocoding for the FROM address field
+  const handleFromInput = useCallback((text) => {
+    setGmSearch(s => ({ ...s, fromText: text, showFromDropdown: true }));
+    if (fromGeoTimerRef.current) clearTimeout(fromGeoTimerRef.current);
+    if (!text || text.length < 2) { setFromSuggestions([]); return; }
+    if (text.toLowerCase().includes('your') || text.toLowerCase().includes('current')) {
+      setFromSuggestions([{ id: '__gps__', place_name: 'Your Current Location (GPS)', center: null }]);
+      return;
+    }
+    fromGeoTimerRef.current = setTimeout(async () => {
+      try {
+        const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(text)}.json?access_token=${TOKEN}&limit=5&types=place,address,locality,neighborhood,poi`;
+        const res = await fetch(url);
+        const data = await res.json();
+        setFromSuggestions(data.features || []);
+      } catch { setFromSuggestions([]); }
+    }, 350);
+  }, [TOKEN]);
+
+  // handleGmSelectDestination: Only sets the parking destination — does NOT start navigation
+  const handleGmSelectDestination = useCallback((area) => {
+    setGmSearch(s => ({ ...s, toText: area.name, toArea: area, showDropdown: false }));
+    toast(`📍 Destination set: ${area.name}. Now click Get Directions.`, 'info');
+  }, [toast]);
+
+  const handleGmLocate = useCallback(() => {
+    setGmSearch(s => ({ ...s, fromText: 'Your Location', showFromDropdown: false }));
+    setFromSuggestions([]);
+  }, []);
+
+  // Resolve campus parking navigation endpoint priority:
+  // 1) area.entryPoint
+  // 2) area.entryGate
+  // 3) polygon centroid
+  const getParkingNavigationPoint = useCallback((area) => {
+    if (!area) return null;
+    if (area.entryPoint) return [area.entryPoint.lng, area.entryPoint.lat];
+    if (area.entryGate) {
+      const gate = gates.find(g => g.id === area.entryGate);
+      if (gate) return [gate.lng, gate.lat];
+    }
+    return centroidOfPolygon(area.coords);
+  }, [gates]);
+
+  // Draw a real-world road-following route from source to selected parking entrance.
+  // Returns true on success; false lets existing fallback logic continue.
+  const getRealRoadRouteToParking = useCallback(async (srcLng, srcLat, destinationArea) => {
+    // Optimized road route should end at selected parking entrance/point.
+    // Fallback to campus main gate only if destination metadata is missing.
+    const target = getParkingNavigationPoint(destinationArea) || MAIN_GATE_COORDS;
+    if (!target) return false;
+
+    const profile = gmSearch.travelMode === 'walking' ? 'walking' : 'driving-traffic';
+    const coordStr = `${srcLng},${srcLat};${target[0]},${target[1]}`;
+    const url = `https://api.mapbox.com/directions/v5/mapbox/${profile}/${coordStr}` +
+      `?geometries=geojson&overview=full&alternatives=true&steps=true&language=en&access_token=${TOKEN}`;
+
+    let routeCoords = null;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (!data.routes || data.routes.length === 0) throw new Error('No routes returned');
+
+      // Explicitly choose the optimized route:
+      // 1) minimum duration, 2) minimum distance.
+      const sortedRoutes = [...data.routes].sort((a, b) => {
+        const durA = Number(a?.duration || Infinity);
+        const durB = Number(b?.duration || Infinity);
+        if (durA !== durB) return durA - durB;
+        return Number(a?.distance || Infinity) - Number(b?.distance || Infinity);
+      });
+
+      const best = sortedRoutes[0];
+      routeCoords = best.geometry.coordinates;
+
+      setOfficialAlternatives(
+        sortedRoutes.slice(0, 3).map(r => ({ distance: r.distance, duration: r.duration }))
+      );
+
+      const mbSteps = best.legs?.[0]?.steps || [];
+      const stripHtml = (s) => (typeof s === 'string' ? s.replace(/<[^>]*>/g, '') : '');
+      const steps = mbSteps.map((s) => ({
+        instruction: stripHtml(s?.maneuver?.instruction) || stripHtml(s?.name) || 'Continue',
+        dist: Math.round(s?.distance || 0)
+      }));
+      if (steps.length > 0) {
+        setNavSteps(steps);
+        setDirectionsOpen(true);
+      }
+
+      setNavInfo({
+        dist: Math.round(best.distance || 0),
+        durationSeconds: Math.round(best.duration || 0),
+        direction: 'STRAIGHT'
+      });
+    } catch (err) {
+      console.warn('[RoadRoute] Failed to build direct road route:', err);
+      return false;
+    }
+
+    const map = mapRef.current;
+    if (!map || !map.isStyleLoaded() || !routeCoords) return false;
+
+    removeOfficialRouteLayers();
+
+    const routeGeoJSON = {
+      type: 'Feature',
+      properties: {},
+      geometry: { type: 'LineString', coordinates: routeCoords }
+    };
+    map.addSource('official-route-src', { type: 'geojson', data: routeGeoJSON });
+    map.addLayer({
+      id: 'official-route-glow',
+      type: 'line',
+      source: 'official-route-src',
+      paint: {
+        'line-color': '#3b82f6',
+        'line-width': 20,
+        'line-blur': 14,
+        'line-opacity': 0.45
+      },
+      layout: { 'line-cap': 'round', 'line-join': 'round' }
+    });
+    map.addLayer({
+      id: 'official-route-line',
+      type: 'line',
+      source: 'official-route-src',
+      paint: {
+        'line-color': '#60a5fa',
+        'line-width': 4,
+        'line-opacity': 1
+      },
+      layout: { 'line-cap': 'round', 'line-join': 'round' }
+    });
+
+    setOfficialRoute(routeCoords);
+    setNavPhase('outside');
+
+    const allLngs = routeCoords.map(c => c[0]);
+    const allLats = routeCoords.map(c => c[1]);
+    map.fitBounds(
+      [[Math.min(...allLngs) - 0.003, Math.min(...allLats) - 0.003],
+       [Math.max(...allLngs) + 0.003, Math.max(...allLats) + 0.003]],
+      { padding: 80, duration: 1200 }
+    );
+
+    return true;
+  }, [TOKEN, gmSearch.travelMode, getParkingNavigationPoint, removeOfficialRouteLayers]);
+
+  const clearRoadRoute = useCallback(() => {
+    removeOfficialRouteLayers();
+    setOfficialRoute(null);
+    setOfficialAlternatives([]);
+    toast('Road route cleared', 'info');
+  }, [removeOfficialRouteLayers, toast]);
+
+  // handleGetDirections: Main orchestrator for full 2-phase navigation
+  // Flow: Source (geocoded address or GPS) → Campus Gate (Mapbox road) → Parking (internal Dijkstra)
+  const handleGetDirections = useCallback(async () => {
+    const destination = gmSearch.toArea;
+    if (!destination) {
+      toast('Please select a parking destination first', 'warning');
+      toInputRef.current?.focus();
+      return;
+    }
+
+    let srcLng, srcLat;
+    const fromText = (gmSearch.fromText || '').trim();
+    const isCurrentLocation = !fromText ||
+      fromText.toLowerCase() === 'your location' ||
+      fromText.toLowerCase() === 'current location' ||
+      fromText.toLowerCase().includes('your current');
+
+    if (isCurrentLocation) {
+      if (!navigator.geolocation) { toast('Geolocation not supported in this browser', 'warning'); return; }
+      toast('📍 Getting your location...', 'info');
+      try {
+        const pos = await new Promise((resolve, reject) =>
+          navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 12000 }));
+        srcLng = pos.coords.longitude;
+        srcLat = pos.coords.latitude;
+        setGmSearch(s => ({ ...s, fromText: 'Your Location' }));
+      } catch {
+        toast('Could not get your location. Please allow location access or type an address.', 'error');
+        return;
+      }
+    } else {
+      toast('📍 Finding your address...', 'info');
+      try {
+        const geoUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(fromText)}.json?access_token=${TOKEN}&limit=1`;
+        const geoRes = await fetch(geoUrl);
+        const geoData = await geoRes.json();
+        if (!geoData.features?.length) {
+          toast('Source address not found. Try using a more specific address or use GPS.', 'error');
+          return;
+        }
+        [srcLng, srcLat] = geoData.features[0].center;
+        setGmSearch(s => ({ ...s, fromText: geoData.features[0].place_name || fromText }));
+      } catch {
+        toast('Error finding source address.', 'error');
+        return;
+      }
+    }
+
+    // ── Reset previous nav state ──────────────────────────────────────────────
+    setNavPhase(null);
+    setOfficialRoute(null);
+    setOfficialAlternatives([]);
+
+    // ── Place user marker at source point ─────────────────────────────────────
+    setUserLocation({ lng: srcLng, lat: srcLat });
+    if (userMarkerRef.current) userMarkerRef.current.remove();
+    const el = document.createElement('div');
+    el.style.cssText = [
+      'width:22px', 'height:22px', 'border-radius:50%',
+      'background:#3b82f6', 'border:3px solid #fff',
+      'box-shadow:0 0 0 6px rgba(59,130,246,0.28)',
+      'animation:locPulse 1.5s infinite'
+    ].join(';');
+    userMarkerRef.current = new mapboxgl.Marker({ element: el })
+      .setLngLat([srcLng, srcLat])
+      .addTo(mapRef.current);
+
+    // ── Set selected destination first
+    setNavTarget(destination);
+
+    // ── NEW: Try direct real road route from source -> parking entrance
+    const directRoadOk = await getRealRoadRouteToParking(srcLng, srcLat, destination);
+    if (directRoadOk) {
+      toast('🛣️ Real road route ready', 'success');
+      return;
+    }
+
+    // ── Find the best campus gate ─────────────────────────────────────────────
+    const entrance = detectMainEntrance(gates);
+
+    if (!entrance || gates.length === 0) {
+      toast('No campus gates defined. Routing directly on campus paths...', 'warning');
+      startCustomNavigation(srcLng, srcLat, gates, routes, parkingAreas, null, destination, false);
+      return;
+    }
+
+    const distToGate = lngLatDist([srcLng, srcLat], [entrance.lng, entrance.lat]);
+    const CAMPUS_THRESHOLD_M = 750;
+    setSelectedEntry(entrance);
+
+    if (distToGate <= CAMPUS_THRESHOLD_M) {
+      // ── User already near campus: Phase 2 only ────────────────────────────
+      toast(`📍 You're near ${entrance.name}! Starting campus navigation...`, 'success');
+      startCustomNavigation(srcLng, srcLat, gates, routes, parkingAreas, entrance, destination, false);
+    } else {
+      // ── Full 2-phase: Phase 1 (road to gate) + Phase 2 (campus to parking) ──
+      // getOfficialRouteToEntrance will draw the blue road route AND
+      // then call startCustomNavigation with keepExternalRoute=true for the yellow campus route
+      toast(`🚗 Phase 1: Real road route → ${entrance.name}`, 'info');
+      getOfficialRouteToEntrance(srcLng, srcLat, entrance, destination);
+
+      // Proximity polling: auto-switch if user actually travels (GPS only)
+      if (isCurrentLocation && navigator.geolocation) {
+        if (proximityWatchRef.current) clearInterval(proximityWatchRef.current);
+        proximityWatchRef.current = setInterval(() => {
+          navigator.geolocation.getCurrentPosition(innerPos => {
+            const { longitude: iLng, latitude: iLat } = innerPos.coords;
+            const nearestDist = Math.min(...gates.map(g => lngLatDist([iLng, iLat], [g.lng, g.lat])));
+            if (nearestDist <= CAMPUS_THRESHOLD_M) {
+              clearInterval(proximityWatchRef.current);
+              proximityWatchRef.current = null;
+              userMarkerRef.current?.setLngLat([iLng, iLat]);
+              setUserLocation({ lng: iLng, lat: iLat });
+              toast('🏫 Arrived at campus! Switching to internal navigation...', 'success');
+              startCustomNavigation(iLng, iLat, gates, routes, parkingAreas, entrance, destination, false);
+            }
+          }, () => {});
+        }, 5000);
+      }
+    }
+  }, [gmSearch, TOKEN, gates, routes, parkingAreas, detectMainEntrance, getOfficialRouteToEntrance, startCustomNavigation, getRealRoadRouteToParking, toast]);
 
   // ── Tool Activation ────────────────────────────────────────────────────────
   const activateTool = useCallback((tool) => {
@@ -1228,6 +1912,30 @@ export default function CampusMap() {
                 <LocateFixed size={15} /> LOCATE MY POSITION
               </button>
 
+              {/* Start Navigation */}
+              <button
+                onClick={handleGetDirections}
+                disabled={!gmSearch.toArea}
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  marginBottom: 16,
+                  borderRadius: 14,
+                  border: '1px solid rgba(16,185,129,0.35)',
+                  background: !gmSearch.toArea ? 'rgba(255,255,255,0.03)' : 'rgba(16,185,129,0.12)',
+                  color: !gmSearch.toArea ? '#64748b' : '#34d399',
+                  fontWeight: 900,
+                  fontSize: 12,
+                  cursor: !gmSearch.toArea ? 'not-allowed' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 8
+                }}
+              >
+                <ArrowRight size={15} /> START NAVIGATION
+              </button>
+
               {/* Global stats */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 20 }}>
                 <div style={{ background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.2)', borderRadius: 14, padding: '14px 12px', textAlign: 'center' }}>
@@ -1240,33 +1948,42 @@ export default function CampusMap() {
                 </div>
               </div>
 
-              {/* Gates */}
-              <div style={{ marginBottom: 20 }}>
-                <div style={{ fontSize: 10, fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: 2, marginBottom: 10 }}>Entry Gates</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {gates.map(g => (
-                    <button key={g.id} onClick={() => handleGateClick(g)} style={{
-                      width: '100%', padding: '14px 16px', borderRadius: 16, border: `2px solid ${selectedEntry?.id === g.id ? '#3b82f6' : 'rgba(255,255,255,0.06)'}`,
-                      background: selectedEntry?.id === g.id ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.04)',
-                      color: selectedEntry?.id === g.id ? '#93c5fd' : '#94a3b8', fontSize: 14, fontWeight: 700,
-                      cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                      transition: 'all 0.2s', boxShadow: selectedEntry?.id === g.id ? '0 0 20px rgba(59,130,246,0.2)' : 'none'
-                    }}>
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <span style={{ width: 10, height: 10, borderRadius: '50%', background: selectedEntry?.id === g.id ? '#3b82f6' : '#10b981', animation: 'gatePulse 2s infinite', display: 'inline-block' }} />
-                        {g.name}
-                      </span>
-                      <Navigation size={16} style={{ opacity: selectedEntry?.id === g.id ? 1 : 0.3, transform: selectedEntry?.id === g.id ? 'rotate(45deg)' : 'none', transition: 'all 0.3s' }} />
-                    </button>
-                  ))}
-                </div>
-              </div>
+              {/* Gate selector removed from user flow: navigation is now source -> selected destination */}
 
-              {/* Navigation Summary */}
-              {selectedEntry && navTarget && (
+              {/* Navigation Summary — Phase-aware */}
+              {navTarget && (selectedEntry || userLocation || navPhase) && (
                 <div style={{ animation: 'slideUp 0.4s ease-out' }}>
+
+                  {/* Phase banner */}
+                  {navPhase === 'outside' && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(59,130,246,0.1)', border: '1px solid rgba(59,130,246,0.3)', borderRadius: 12, padding: '8px 12px', marginBottom: 10 }}>
+                      <span style={{ fontSize: 14 }}>🚗</span>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: '#60a5fa' }}>Phase 1 — Following real roads to campus gate</span>
+                    </div>
+                  )}
+                  {navPhase === 'both' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 10 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(59,130,246,0.1)', border: '1px solid rgba(59,130,246,0.3)', borderRadius: 10, padding: '6px 10px' }}>
+                        <span style={{ fontSize: 12 }}>🚗</span>
+                        <span style={{ fontSize: 10, fontWeight: 700, color: '#60a5fa' }}>Phase 1: Road route → Gate (blue)</span>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(251,191,36,0.1)', border: '1px solid rgba(251,191,36,0.3)', borderRadius: 10, padding: '6px 10px' }}>
+                        <span style={{ fontSize: 12 }}>🏫</span>
+                        <span style={{ fontSize: 10, fontWeight: 700, color: '#fbbf24' }}>Phase 2: Campus path → Parking (yellow)</span>
+                      </div>
+                    </div>
+                  )}
+                  {navPhase === 'inside' && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', borderRadius: 12, padding: '8px 12px', marginBottom: 10 }}>
+                      <span style={{ fontSize: 14 }}>🏫</span>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: '#10b981' }}>Phase 2 — Campus internal navigation</span>
+                    </div>
+                  )}
+
                   <div style={{ background: 'rgba(16,185,129,0.08)', border: '2px solid rgba(16,185,129,0.2)', borderRadius: 20, padding: '20px 18px', marginBottom: 12, boxShadow: '0 0 30px rgba(16,185,129,0.1)' }}>
-                    <div style={{ fontSize: 10, color: '#10b981', fontWeight: 800, letterSpacing: 2, textTransform: 'uppercase', marginBottom: 8 }}>Now Routing To</div>
+                    <div style={{ fontSize: 10, color: '#10b981', fontWeight: 800, letterSpacing: 2, textTransform: 'uppercase', marginBottom: 8 }}>
+                      {navPhase === 'outside' ? 'Heading to Entrance' : 'Now Routing To'}
+                    </div>
                     <div style={{ fontSize: 20, fontWeight: 900, color: '#fff', marginBottom: 16, letterSpacing: -0.5 }}>{navTarget.name}</div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
                       <Milestone size={18} style={{ color: '#10b981' }} />
@@ -1275,28 +1992,33 @@ export default function CampusMap() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                       <ArrowUpCircle size={18} style={{ color: '#3b82f6' }} />
                       <span style={{ fontWeight: 700, fontSize: 13, color: '#94a3b8' }}>
-                        {navTarget.total - navTarget.occupied} slots available ({Math.round(navTarget.occupied / navTarget.total * 100)}% full)
+                        {navTarget.total - navTarget.occupied} slots available
+                        {navTarget.total > 0 ? ` (${Math.round(navTarget.occupied / navTarget.total * 100)}% full)` : ''}
                       </span>
                     </div>
                   </div>
 
-                  {/* Recommendation list */}
-                  <div style={{ fontSize: 10, fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: 2, marginBottom: 8 }}>Nearby Options</div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
-                    {recommendations.map((z, i) => (
-                      <button key={z.id} onClick={() => setNavTarget(z)} style={{
-                        padding: '12px 14px', borderRadius: 14, border: `1px solid ${navTarget?.id === z.id ? 'rgba(16,185,129,0.4)' : 'rgba(255,255,255,0.07)'}`,
-                        background: navTarget?.id === z.id ? 'rgba(16,185,129,0.12)' : 'rgba(255,255,255,0.03)',
-                        color: '#e2e8f0', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, transition: 'all 0.2s'
-                      }}>
-                        <span style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 700 }}>
-                          <span style={{ width: 6, height: 6, borderRadius: '50%', background: statusColor(z.occupied, z.total), display: 'inline-block' }} />
-                          {i === 0 ? '⭐ ' : ''}{z.name}
-                        </span>
-                        <span style={{ fontSize: 11, color: '#64748b', fontWeight: 600 }}>{z.total - z.occupied} free</span>
-                      </button>
-                    ))}
-                  </div>
+                  {/* Recommendation list — only shown in Phase 2 (custom nav) */}
+                  {navPhase !== 'outside' && recommendations.length > 0 && (
+                    <>
+                      <div style={{ fontSize: 10, fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: 2, marginBottom: 8 }}>Nearby Options</div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
+                        {recommendations.map((z, i) => (
+                          <button key={z.id} onClick={() => setNavTarget(z)} style={{
+                            padding: '12px 14px', borderRadius: 14, border: `1px solid ${navTarget?.id === z.id ? 'rgba(16,185,129,0.4)' : 'rgba(255,255,255,0.07)'}`,
+                            background: navTarget?.id === z.id ? 'rgba(16,185,129,0.12)' : 'rgba(255,255,255,0.03)',
+                            color: '#e2e8f0', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, transition: 'all 0.2s'
+                          }}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 700 }}>
+                              <span style={{ width: 6, height: 6, borderRadius: '50%', background: statusColor(z.occupied, z.total), display: 'inline-block' }} />
+                              {i === 0 ? '⭐ ' : ''}{z.name}
+                            </span>
+                            <span style={{ fontSize: 11, color: '#64748b', fontWeight: 600 }}>{z.total - z.occupied} free</span>
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
 
                   <button onClick={resetNav} style={{ width: '100%', padding: '12px', borderRadius: 14, border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)', color: '#f87171', fontWeight: 700, fontSize: 12, cursor: 'pointer' }}>
                     Cancel Navigation
@@ -1304,10 +2026,10 @@ export default function CampusMap() {
                 </div>
               )}
 
-              {!selectedEntry && (
+              {!selectedEntry && !navPhase && (
                 <div style={{ textAlign: 'center', padding: '40px 20px', opacity: 0.3 }}>
                   <Navigation2 size={60} style={{ margin: '0 auto 16px', color: '#3b82f6' }} />
-                  <p style={{ fontSize: 13, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1, lineHeight: 1.6 }}>Tap a gate on the map<br />or below to start routing</p>
+                  <p style={{ fontSize: 13, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1, lineHeight: 1.6 }}>Tap a gate on the map<br />or locate yourself to start routing</p>
                 </div>
               )}
             </div>
@@ -1425,6 +2147,325 @@ export default function CampusMap() {
       {/* ── Map Area ─────────────────────────────────────────────────────────── */}
       <div style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column' }}>
 
+        {/* ── Google Maps-style Search Bar ─────────────────────────────── */}
+        {!isEditMode && (
+          <div style={{
+            position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
+            zIndex: 30, width: 440, maxWidth: 'calc(100vw - 420px)',
+            pointerEvents: 'auto'
+          }}>
+            <div style={{
+              background: 'rgba(10,14,28,0.96)', backdropFilter: 'blur(24px)',
+              borderRadius: 20, border: '1px solid rgba(255,255,255,0.12)',
+              boxShadow: '0 8px 40px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05)',
+              overflow: 'visible', position: 'relative'
+            }}>
+              {/* Trip waypoints strip: Source → Gate → Parking */}
+              <div style={{ padding: '10px 16px 0', display: 'flex', alignItems: 'center', gap: 6, fontSize: 10, color: '#475569', fontWeight: 800, textTransform: 'uppercase', letterSpacing: 1 }}>
+                <span style={{ color: '#3b82f6' }}>📍 From</span>
+                <span>──▶──</span>
+                {gates.length > 0 && <><span style={{ color: '#f59e0b' }}>🚪 {detectMainEntrance(gates)?.name || 'Gate'}</span><span>──▶──</span></>}
+                <span style={{ color: '#10b981' }}>🅿️ Parking</span>
+              </div>
+
+              {/* FROM row with geocoding dropdown */}
+              <div style={{ position: 'relative' }}>
+                <div style={{ display: 'flex', alignItems: 'center', padding: '10px 16px 6px', gap: 12 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                    <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#3b82f6', border: '2px solid #93c5fd', boxShadow: '0 0 8px rgba(59,130,246,0.6)' }} />
+                    <div style={{ width: 1.5, height: 20, background: 'linear-gradient(to bottom, #3b82f6, #10b981)', opacity: 0.6 }} />
+                  </div>
+                  <input
+                    ref={fromInputRef}
+                    value={gmSearch.fromText}
+                    onChange={e => handleFromInput(e.target.value)}
+                    onFocus={e => { e.target.style.borderColor = 'rgba(59,130,246,0.6)'; if (gmSearch.fromText && gmSearch.fromText !== 'Your Location') setGmSearch(s => ({ ...s, showFromDropdown: true })); }}
+                    onBlur={e => { e.target.style.borderColor = 'rgba(255,255,255,0.1)'; setTimeout(() => setGmSearch(s => ({ ...s, showFromDropdown: false })), 200); }}
+                    placeholder="Type home address, city, or landmark..."
+                    style={{
+                      flex: 1, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)',
+                      borderRadius: 10, padding: '8px 12px', color: '#f1f5f9', fontSize: 13, fontWeight: 600,
+                      outline: 'none', transition: 'border-color 0.2s'
+                    }}
+                  />
+                  <button onClick={handleGmLocate} title="Use GPS location" style={{
+                    background: 'rgba(59,130,246,0.15)', border: '1px solid rgba(59,130,246,0.3)',
+                    borderRadius: 10, padding: '7px 10px', color: '#60a5fa', cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', flexShrink: 0, transition: 'all 0.2s'
+                  }}>
+                    <LocateFixed size={15} />
+                  </button>
+                </div>
+
+                {/* FROM geocoding autocomplete dropdown */}
+                {gmSearch.showFromDropdown && fromSuggestions.length > 0 && (
+                  <div style={{
+                    position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 50,
+                    background: 'rgba(10,14,28,0.99)', backdropFilter: 'blur(20px)',
+                    border: '1px solid rgba(255,255,255,0.12)', borderRadius: '0 0 16px 16px',
+                    boxShadow: '0 16px 40px rgba(0,0,0,0.8)', overflow: 'hidden'
+                  }}>
+                    <div style={{ padding: '6px 16px 4px', fontSize: 10, color: '#475569', fontWeight: 800, textTransform: 'uppercase', letterSpacing: 1 }}>Suggested Locations</div>
+                    {fromSuggestions.map((s, i) => (
+                      <button key={s.id || i} onMouseDown={() => {
+                        if (s.id === '__gps__') {
+                          handleGmLocate();
+                        } else {
+                          setGmSearch(prev => ({ ...prev, fromText: s.place_name, showFromDropdown: false }));
+                          setFromSuggestions([]);
+                        }
+                      }} style={{
+                        width: '100%', display: 'flex', alignItems: 'center', gap: 12,
+                        padding: '10px 16px', background: 'transparent', border: 'none',
+                        cursor: 'pointer', borderBottom: '1px solid rgba(255,255,255,0.04)',
+                        transition: 'background 0.15s', textAlign: 'left'
+                      }}
+                        onMouseEnter={e => e.currentTarget.style.background = 'rgba(59,130,246,0.1)'}
+                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                      >
+                        <div style={{ width: 28, height: 28, borderRadius: 8, background: s.id === '__gps__' ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                          {s.id === '__gps__' ? <LocateFixed size={13} color="#3b82f6" /> : <MapPin size={13} color="#64748b" />}
+                        </div>
+                        <div style={{ flex: 1, overflow: 'hidden' }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: '#f1f5f9', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {s.place_name?.split(',')[0] || s.place_name}
+                          </div>
+                          {s.place_name?.includes(',') && (
+                            <div style={{ fontSize: 10, color: '#64748b', marginTop: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                              {s.place_name.split(',').slice(1).join(',').trim()}
+                            </div>
+                          )}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* TO row — campus parking search */}
+              <div style={{ display: 'flex', alignItems: 'center', padding: '4px 16px 10px', gap: 12, position: 'relative' }}>
+                <div style={{ width: 10, height: 10, borderRadius: 2, background: '#10b981', border: '2px solid #6ee7b7', transform: 'rotate(45deg)', marginLeft: 0, flexShrink: 0, boxShadow: '0 0 8px rgba(16,185,129,0.6)' }} />
+                <input
+                  ref={toInputRef}
+                  value={gmSearch.toText}
+                  onChange={e => { setGmSearch(s => ({ ...s, toText: e.target.value, showDropdown: true, toArea: null })); }}
+                  onFocus={e => { e.target.style.borderColor = 'rgba(16,185,129,0.6)'; setGmSearch(s => ({ ...s, showDropdown: true })); }}
+                  placeholder="Search campus parking areas…"
+                  style={{
+                    flex: 1, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)',
+                    borderRadius: 10, padding: '8px 12px', color: '#f1f5f9', fontSize: 13, fontWeight: 600,
+                    outline: 'none', transition: 'border-color 0.2s'
+                  }}
+                  onBlur={e => { e.target.style.borderColor = 'rgba(255,255,255,0.1)'; setTimeout(() => setGmSearch(s => ({ ...s, showDropdown: false })), 200); }}
+                />
+                {gmSearch.toText && (
+                  <button onClick={() => setGmSearch(s => ({ ...s, toText: '', toArea: null, showDropdown: false }))} style={{
+                    background: 'rgba(255,255,255,0.08)', border: 'none', borderRadius: 8, padding: '6px 8px',
+                    color: '#94a3b8', cursor: 'pointer', display: 'flex', alignItems: 'center'
+                  }}><X size={14} /></button>
+                )}
+              </div>
+
+              {/* Travel Mode + ── GET DIRECTIONS CTA ── */}
+              <div style={{ display: 'flex', borderTop: '1px solid rgba(255,255,255,0.07)', padding: '8px 12px', gap: 6, alignItems: 'center' }}>
+                {[{ mode: 'driving', icon: <Car size={14} />, label: 'Drive' }, { mode: 'walking', icon: <PersonStanding size={14} />, label: 'Walk' }].map(m => (
+                  <button key={m.mode} onClick={() => setGmSearch(s => ({ ...s, travelMode: m.mode }))} style={{
+                    display: 'flex', alignItems: 'center', gap: 5, padding: '5px 12px', borderRadius: 20,
+                    border: gmSearch.travelMode === m.mode ? '1px solid rgba(59,130,246,0.5)' : '1px solid rgba(255,255,255,0.08)',
+                    background: gmSearch.travelMode === m.mode ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.04)',
+                    color: gmSearch.travelMode === m.mode ? '#93c5fd' : '#64748b',
+                    fontSize: 11, fontWeight: 700, cursor: 'pointer', transition: 'all 0.2s'
+                  }}>
+                    {m.icon} {m.label}
+                  </button>
+                ))}
+                <button
+                  onClick={handleGetDirections}
+                  disabled={!gmSearch.toArea}
+                  style={{
+                    marginLeft: 6,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '6px 12px',
+                    borderRadius: 20,
+                    border: '1px solid rgba(16,185,129,0.35)',
+                    background: !gmSearch.toArea ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.16)',
+                    color: !gmSearch.toArea ? '#64748b' : '#34d399',
+                    fontSize: 11,
+                    fontWeight: 800,
+                    cursor: !gmSearch.toArea ? 'not-allowed' : 'pointer',
+                    transition: 'all 0.2s'
+                  }}
+                >
+                  <ArrowRight size={13} />
+                  Get Directions
+                </button>
+                <button
+                  onClick={clearRoadRoute}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '6px 10px',
+                    borderRadius: 20,
+                    border: '1px solid rgba(239,68,68,0.3)',
+                    background: 'rgba(239,68,68,0.08)',
+                    color: '#fca5a5',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    transition: 'all 0.2s'
+                  }}
+                >
+                  <X size={12} />
+                  Clear Route
+                </button>
+                {gmSearch.toArea && (
+                  <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#10b981', fontWeight: 700 }}>
+                    <Target size={12} />
+                    ~{navInfo.dist}m · {navInfo.durationSeconds ? Math.round(navInfo.durationSeconds / 60) : Math.round(navInfo.dist / (gmSearch.travelMode === 'walking' ? 80 : 250))} min
+                  </div>
+                )}
+              </div>
+
+              {/* Autocomplete dropdown */}
+              {gmSearch.showDropdown && parkingAreas.length > 0 && (
+                <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', maxHeight: 240, overflowY: 'auto' }}>
+                  <div style={{ padding: '6px 16px 4px', fontSize: 10, color: '#475569', fontWeight: 800, textTransform: 'uppercase', letterSpacing: 1 }}>Parking Areas</div>
+                  {parkingAreas
+                    .filter(p => !gmSearch.toText || p.name.toLowerCase().includes(gmSearch.toText.toLowerCase()))
+                    .map(p => {
+                      const pct = p.total ? Math.round(p.occupied / p.total * 100) : 0;
+                      const free = p.total - p.occupied;
+                      const color = statusColor(p.occupied, p.total);
+                      return (
+                        <button key={p.id} onMouseDown={() => handleGmSelectDestination(p)} style={{
+                          width: '100%', display: 'flex', alignItems: 'center', gap: 12,
+                          padding: '10px 16px', background: 'transparent',
+                          border: 'none', cursor: 'pointer', transition: 'background 0.15s',
+                          borderBottom: '1px solid rgba(255,255,255,0.04)'
+                        }}
+                          onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}
+                          onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                        >
+                          <div style={{ width: 32, height: 32, borderRadius: 10, background: `${color}22`, border: `1px solid ${color}55`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                            <MapPin size={14} color={color} />
+                          </div>
+                          <div style={{ flex: 1, textAlign: 'left' }}>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: '#f1f5f9' }}>{p.name}</div>
+                            <div style={{ fontSize: 11, color: '#64748b', marginTop: 1 }}>{free} free of {p.total} · {pct}% full</div>
+                          </div>
+                          <div style={{ width: 36, height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.08)', overflow: 'hidden', flexShrink: 0 }}>
+                            <div style={{ width: `${pct}%`, height: '100%', background: color, borderRadius: 3, transition: 'width 0.3s' }} />
+                          </div>
+                        </button>
+                      );
+                    })
+                  }
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── Directions Step Panel ─────────────────────────────────────── */}
+        {directionsOpen && navSteps.length > 0 && (
+          <div style={{
+            position: 'absolute', top: 160, left: 16, zIndex: 25, width: 300,
+            background: 'rgba(10,14,28,0.97)', backdropFilter: 'blur(24px)',
+            border: '1px solid rgba(255,255,255,0.1)', borderRadius: 20,
+            boxShadow: '0 8px 40px rgba(0,0,0,0.6)',
+            overflow: 'hidden', animation: 'slideInLeft 0.35s cubic-bezier(0.34,1.56,0.64,1)',
+            pointerEvents: 'auto'
+          }}>
+            {/* Header */}
+            <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ background: 'rgba(16,185,129,0.15)', border: '1px solid rgba(16,185,129,0.3)', borderRadius: 10, padding: 6, display: 'flex' }}>
+                <CornerDownRight size={14} color="#10b981" />
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, fontWeight: 800, color: '#f1f5f9', letterSpacing: 0.3 }}>Directions</div>
+                <div style={{ fontSize: 10, color: '#10b981', fontWeight: 700, marginTop: 1 }}>
+                  {gmSearch.fromText} → {gmSearch.toArea?.name}
+                </div>
+              </div>
+              <button onClick={() => setDirectionsOpen(false)} style={{ background: 'rgba(255,255,255,0.07)', border: 'none', borderRadius: 8, padding: '4px 6px', color: '#64748b', cursor: 'pointer', display: 'flex' }}>
+                <X size={13} />
+              </button>
+            </div>
+
+            {/* Summary bar */}
+            <div style={{ padding: '10px 16px', background: 'rgba(16,185,129,0.06)', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', gap: 16 }}>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: 20, fontWeight: 900, color: '#10b981' }}>{navInfo.dist}m</div>
+                <div style={{ fontSize: 9, color: '#64748b', fontWeight: 800, textTransform: 'uppercase', letterSpacing: 1 }}>Distance</div>
+              </div>
+              <div style={{ width: 1, height: 30, background: 'rgba(255,255,255,0.1)' }} />
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: 20, fontWeight: 900, color: '#f59e0b' }}>{Math.max(1, navInfo.durationSeconds ? Math.round(navInfo.durationSeconds / 60) : Math.round(navInfo.dist / (gmSearch.travelMode === 'walking' ? 80 : 250)))} min</div>
+                <div style={{ fontSize: 9, color: '#64748b', fontWeight: 800, textTransform: 'uppercase', letterSpacing: 1 }}>ETA</div>
+              </div>
+              <div style={{ width: 1, height: 30, background: 'rgba(255,255,255,0.1)' }} />
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: 20, fontWeight: 900, color: '#3b82f6' }}>{navTarget ? navTarget.total - navTarget.occupied : '–'}</div>
+                <div style={{ fontSize: 9, color: '#64748b', fontWeight: 800, textTransform: 'uppercase', letterSpacing: 1 }}>Slots</div>
+              </div>
+            </div>
+
+            {/* Alternative routes summary (Mapbox outside phase) */}
+            {officialAlternatives && officialAlternatives.length > 1 && (
+              <div style={{ padding: '10px 16px', borderBottom: '1px solid rgba(255,255,255,0.07)' }}>
+                <div style={{ fontSize: 10, fontWeight: 900, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>
+                  Alternatives
+                </div>
+                {officialAlternatives.map((r, i) => (
+                  <div key={i} style={{ fontSize: 12, color: '#e2e8f0', display: 'flex', justifyContent: 'space-between', gap: 10, padding: '4px 0' }}>
+                    <span style={{ fontWeight: 800 }}>{i + 1}.</span>
+                    <span style={{ color: '#94a3b8', fontWeight: 700 }}>
+                      {r.distance ? `${(Math.round(r.distance / 10) / 100).toFixed(1)} km` : '–'} · {r.duration ? `${Math.max(1, Math.round(r.duration / 60))} min` : '–'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Steps */}
+            <div style={{ maxHeight: 280, overflowY: 'auto', padding: '6px 0', scrollbarWidth: 'thin', scrollbarColor: '#334155 transparent' }}>
+              {navSteps.map((step, i) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '10px 16px', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexShrink: 0, marginTop: 2 }}>
+                    <div style={{
+                      width: 28, height: 28, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      background: i === navSteps.length - 1 ? 'rgba(16,185,129,0.2)' : 'rgba(59,130,246,0.15)',
+                      border: `1.5px solid ${i === navSteps.length - 1 ? 'rgba(16,185,129,0.5)' : 'rgba(59,130,246,0.4)'}`,
+                      color: i === navSteps.length - 1 ? '#10b981' : '#60a5fa', fontSize: 10, fontWeight: 800
+                    }}>
+                      {i === navSteps.length - 1 ? <Target size={12} /> : (i + 1)}
+                    </div>
+                    {i < navSteps.length - 1 && (
+                      <div style={{ width: 1.5, height: 16, background: 'rgba(59,130,246,0.25)', marginTop: 3 }} />
+                    )}
+                  </div>
+                  <div style={{ flex: 1, paddingTop: 4 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0', lineHeight: 1.4 }}>{step.instruction}</div>
+                    {step.dist > 0 && (
+                      <div style={{ fontSize: 10, color: '#64748b', marginTop: 3, fontWeight: 600 }}>{step.dist}m</div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Cancel button */}
+            <div style={{ padding: '10px 16px', borderTop: '1px solid rgba(255,255,255,0.07)' }}>
+              <button onClick={resetNav} style={{ width: '100%', padding: '9px', borderRadius: 12, border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)', color: '#f87171', fontWeight: 700, fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                <X size={13} /> Cancel Navigation
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Top HUD */}
         <div style={{ position: 'absolute', top: 20, left: 20, right: 20, zIndex: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', pointerEvents: 'none' }}>
 
@@ -1458,8 +2499,38 @@ export default function CampusMap() {
                 <input type="file" accept=".json" style={{ display: 'none' }} ref={fileInputRef} onChange={handleFileUpload} />
                 <TBtn icon={<Trash2 size={16} />} label="Clear All" active={false} onClick={() => {
                   if (window.confirm('Are you sure you want to delete all parking areas, routes, and gates? This cannot be undone.')) {
+                    // ── Clear data state ────────────────────────────────────────
                     setParkingAreas([]); setRoutes([]); setGates([]);
+
+                    // ── Clear draw plugin features ──────────────────────────────
                     if (drawRef.current) drawRef.current.deleteAll();
+
+                    // ── Clear ALL map layers & sources (nav + official route) ───
+                    // resetNav clears nav state + nav layers on the map;
+                    // removeOfficialRouteLayers clears the Mapbox Directions layer.
+                    const map = mapRef.current;
+                    if (map && map.isStyleLoaded()) {
+                      ['nav-glow', 'nav-dash', 'nav-dots', 'nav-target-area-fill', 'nav-target-area-line'].forEach(id => {
+                        if (map.getLayer(id)) map.removeLayer(id);
+                      });
+                      if (map.getSource('nav-src')) map.removeSource('nav-src');
+                      if (map.getSource('nav-target-src')) map.removeSource('nav-target-src');
+                      ['official-route-glow', 'official-route-line'].forEach(id => {
+                        if (map.getLayer(id)) map.removeLayer(id);
+                      });
+                      if (map.getSource('official-route-src')) map.removeSource('official-route-src');
+                    }
+
+                    // ── Reset all navigation state ──────────────────────────────
+                    setNavTarget(null);
+                    setSelectedEntry(null);
+                    setRecommendations([]);
+                    setNavPhase(null);
+                    setOfficialRoute(null);
+                    setUserLocation(null);
+                    if (userMarkerRef.current) { userMarkerRef.current.remove(); userMarkerRef.current = null; }
+                    if (proximityWatchRef.current) { clearInterval(proximityWatchRef.current); proximityWatchRef.current = null; }
+
                     toast('All map data cleared', 'warning');
                   }
                 }} color="#ef4444" />
@@ -1545,6 +2616,10 @@ export default function CampusMap() {
         @keyframes slideDown {
           from { transform:translateY(-12px); opacity:0; }
           to { transform:translateY(0); opacity:1; }
+        }
+        @keyframes slideInLeft {
+          from { transform:translateX(-24px); opacity:0; }
+          to { transform:translateX(0); opacity:1; }
         }
         .mapboxgl-ctrl-group { display:none !important; }
         .mapboxgl-ctrl-attrib { display:none !important; }

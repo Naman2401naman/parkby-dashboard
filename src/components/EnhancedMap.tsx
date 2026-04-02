@@ -42,7 +42,7 @@ export function EnhancedMap({
   parking,
   gates,
   selectedGateId,
-  onParkingUpdate,
+  onParkingUpdate: _onParkingUpdate,
   recommendedParkingId
 }: EnhancedMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
