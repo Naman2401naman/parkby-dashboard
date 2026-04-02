@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import CampusNavMap from './CampusNavMap';
 import { io } from 'socket.io-client';
 import { Chart, registerables } from 'chart.js';
 
@@ -590,8 +591,8 @@ export default function LiveDashboard() {
             {Array.from({ length: Math.max(0, 11 - data.groups.length) }).map((_, i) => (
               <div key={`placeholder-${i}`} style={{ borderRadius: 14, background: '#f1f5f9', border: '1px solid #e2e8f0', animation: 'shimmer 2s infinite' }} />
             ))}
-            {/* 12th cell: Legend */}
-            <LegendCard />
+            {/* 12th cell: Campus Navigation Map */}
+            <CampusNavMap parkingGroups={data.groups} />
           </div>
 
           {/* Right Column: Log + Chart — 4 columns × 3 rows */}

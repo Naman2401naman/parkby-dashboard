@@ -47,7 +47,7 @@ function EnhancedApp() {
 
     const calculateStats = useCallback((): ParkingStats => {
         // Get all parking areas from your draw instance
-        const parkingAreas = []; // draw.current?.getAll().features.filter(...)
+        const parkingAreas: any[] = []; // draw.current?.getAll().features.filter(...)
 
         const totalSpots = parkingAreas.reduce((sum, area) =>
             sum + (area.properties?.totalSlots || 0), 0);
@@ -77,7 +77,7 @@ function EnhancedApp() {
 
     const getSearchableAreas = useCallback((): ParkingAreaSearchResult[] => {
         // Get all parking areas from your draw instance
-        const parkingAreas = []; // draw.current?.getAll().features.filter(...)
+        const parkingAreas: any[] = []; // draw.current?.getAll().features.filter(...)
 
         return parkingAreas.map(area => {
             const total = area.properties?.totalSlots || 0;
@@ -197,7 +197,7 @@ function EnhancedApp() {
 
         const interval = setInterval(() => {
             // Get parking areas and simulate change
-            const parkingAreas = []; // draw.current?.getAll().features.filter(...)
+            const parkingAreas: any[] = []; // draw.current?.getAll().features.filter(...)
             const update = simulateOccupancyChange(parkingAreas);
 
             if (update) {
