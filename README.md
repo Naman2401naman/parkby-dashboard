@@ -259,4 +259,3 @@ For issues and questions:
 
 ---
 
-**Built with ❤️ for smart parking management**
