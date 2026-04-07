@@ -5,7 +5,6 @@ A **production-ready**, futuristic parking management system with real-time data
 ![Status](https://img.shields.io/badge/status-production--ready-brightgreen)
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
 
----
 
 ## ✨ Features
 
